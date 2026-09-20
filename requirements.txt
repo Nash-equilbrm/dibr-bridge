@@ -1,0 +1,4 @@
+livekit>=1.0.0
+opencv-python>=4.9.0
+numpy>=1.26.0
+requests>=2.31.0
