@@ -20,16 +20,17 @@ def main() -> None:
     # add_camera checks new cameras against — see opendibr-c3's findings).
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
+    parser.add_argument("--room-code", required=True, help="LiveKit room code to join, e.g. FADW88")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
     logging.basicConfig(level=args.log_level, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 
-    asyncio.run(_run(args.server_url, args.rtsp_base, args.width, args.height))
+    asyncio.run(_run(args.server_url, args.rtsp_base, args.width, args.height, args.room_code))
 
 
-async def _run(server_url: str, rtsp_base: str, width: int, height: int) -> None:
-    session = BridgeSession(server_url, rtsp_base, width, height)
+async def _run(server_url: str, rtsp_base: str, width: int, height: int, room_code: str) -> None:
+    session = BridgeSession(server_url, rtsp_base, width, height, room_code)
     await session.start()
     await serve(session)
 

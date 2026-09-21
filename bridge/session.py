@@ -11,6 +11,7 @@ import asyncio
 import dataclasses
 import logging
 
+import cv2
 import numpy as np
 
 from .livekit_source import LiveKitCameraHub
@@ -48,11 +49,12 @@ class _CameraState:
 
 
 class BridgeSession:
-    def __init__(self, server_url: str, rtsp_base: str, width: int = 1280, height: int = 720):
+    def __init__(self, server_url: str, rtsp_base: str, width: int = 1280, height: int = 720, room_code: str = ""):
         self._reg = RegistrationClient(server_url)
         self._rtsp_base = rtsp_base.rstrip("/")
         self._width = width
         self._height = height
+        self._room_code = room_code
         self._hub: LiveKitCameraHub | None = None
         self._cameras: dict[str, _CameraState] = {}
         self._active_pair: tuple[str, str] | None = None
@@ -60,7 +62,7 @@ class BridgeSession:
         self._placeholder_task: asyncio.Task | None = None
 
     async def start(self) -> None:
-        token = self._reg.fetch_viewer_token()
+        token = self._reg.fetch_viewer_token(room_code=self._room_code or None)
         self._hub = LiveKitCameraHub(token.livekit_url, token.token)
         await self._hub.connect()
         log.info("Connected to LiveKit at %s", token.livekit_url)
@@ -98,6 +100,12 @@ class BridgeSession:
         log.info("Placeholder stream (%dx%d) live at %s / %s — required for OpenDIBR's startup JSON",
                   self._width, self._height, color_url, depth_url)
 
+    def _resize(self, frame: np.ndarray) -> np.ndarray:
+        h, w = frame.shape[:2]
+        if w == self._width and h == self._height:
+            return frame
+        return cv2.resize(frame, (self._width, self._height))
+
     # ── Control channel command handlers ────────────────────────────────
 
     async def add_camera(self, name: str) -> tuple[str, str]:
@@ -107,23 +115,23 @@ class BridgeSession:
 
         await self._hub.subscribe(name)
         frame = self._hub.latest_frame(name)
-        h, w = frame.shape[:2]
+        native_h, native_w = frame.shape[:2]
 
         color_url = f"{self._rtsp_base}/{name}_color"
         depth_url = f"{self._rtsp_base}/{name}_depth"
 
-        color_pub = RtspPublisher(color_url, w, h, fps=COLOR_FPS, pix_fmt_in="bgr24")
-        # 8-bit YUV420p, matching bitDepthDepth=8 sent in OpenDIBR's
-        # add_camera call (OpenDibrSessionManager.cs) — see
-        # encode_depth_yuv420p's docstring for why (H.264/HEVC decode
-        # compatibility, per opendibr-c3's confirmation).
-        depth_pub = RtspPublisher(depth_url, w, h, fps=DEPTH_FPS, pix_fmt_in="yuv420p")
+        # Always publish at the configured output resolution so OpenDIBR
+        # receives streams that match its declared add_camera dimensions and
+        # StereoDepthComputer receives frames that match calibration resolution.
+        color_pub = RtspPublisher(color_url, self._width, self._height, fps=COLOR_FPS, pix_fmt_in="bgr24")
+        depth_pub = RtspPublisher(depth_url, self._width, self._height, fps=DEPTH_FPS, pix_fmt_in="yuv420p")
         color_pub.start()
         depth_pub.start()
 
         pump_task = asyncio.ensure_future(self._pump_color(name, color_pub))
         self._cameras[name] = _CameraState(color_url, depth_url, color_pub, depth_pub, pump_task)
-        log.info("Added camera '%s' (%dx%d) -> %s / %s", name, w, h, color_url, depth_url)
+        log.info("Added camera '%s' (%dx%d → %dx%d) -> %s / %s",
+                 name, native_w, native_h, self._width, self._height, color_url, depth_url)
         return color_url, depth_url
 
     async def remove_camera(self, name: str) -> None:
@@ -152,10 +160,10 @@ class BridgeSession:
             raise ValueError(f"No calibration for pair ({cam_a}, {cam_b})")
         calib_a, calib_b = calib
 
-        computer = StereoDepthComputer(calib_a, calib_b)
+        computer = StereoDepthComputer(calib_a, calib_b, out_size=(self._width, self._height))
 
-        frame_a = self._hub.latest_frame(cam_a)
-        frame_b = self._hub.latest_frame(cam_b)
+        frame_a = self._resize(self._hub.latest_frame(cam_a))
+        frame_b = self._resize(self._hub.latest_frame(cam_b))
         depth_a, depth_b = computer.compute_pair(frame_a, frame_b)
 
         min_a, max_a = self._range_with_margin(depth_a)
@@ -176,7 +184,7 @@ class BridgeSession:
             while True:
                 frame = self._hub.latest_frame(name)
                 if frame is not None:
-                    publisher.push(frame)
+                    publisher.push(self._resize(frame))
                 await asyncio.sleep(1.0 / COLOR_FPS)
         except asyncio.CancelledError:
             pass
@@ -190,7 +198,7 @@ class BridgeSession:
                 frame_a = self._hub.latest_frame(cam_a)
                 frame_b = self._hub.latest_frame(cam_b)
                 if frame_a is not None and frame_b is not None:
-                    depth_a, depth_b = computer.compute_pair(frame_a, frame_b)
+                    depth_a, depth_b = computer.compute_pair(self._resize(frame_a), self._resize(frame_b))
                     st_a.depth_publisher.push(encode_depth_yuv420p(depth_a, min_a, max_a))
                     st_b.depth_publisher.push(encode_depth_yuv420p(depth_b, min_b, max_b))
                 await asyncio.sleep(1.0 / DEPTH_FPS)
