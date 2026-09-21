@@ -36,9 +36,23 @@ mediamtx → bridge → OpenDIBR for real.
 Local dev setup (already done once in this environment, only needed again
 if re-freezing after a code change): a `.venv` exists here with
 `requirements.txt` + `pyinstaller` installed;
-`python -m PyInstaller --onedir --name dibr-bridge --console --noconfirm entrypoint.py`
+`python -m PyInstaller --noconfirm --clean dibr-bridge.spec`
 rebuilds `dist/dibr-bridge/`, which then needs re-copying into
 `Assets/StreamingAssets/DibrBridge/`.
+
+**Always build from `dibr-bridge.spec`, never `python -m PyInstaller
+entrypoint.py --name dibr-bridge ...` directly** — passing a script (not a
+`.spec` path) makes PyInstaller silently regenerate and overwrite
+`dibr-bridge.spec` with bare defaults, which **deletes the
+`collect_all('livekit')` fix** (needed to bundle `livekit_ffi.dll` — without
+it the frozen exe raises `ImportError` on launch, before ever reaching
+`--help` or any real code). This is exactly what happened here: an earlier
+session's `collect_all` fix never actually made it into any build because
+every rebuild since then followed the (wrong) instruction that used to be
+written here, each time reverting its own fix. Confirmed 2026-09-21: after
+rebuilding from the `.spec` file, `livekit_ffi.dll` is present and a real
+launch reaches its actual HTTP call (`/viewer-token`) rather than an
+`ImportError`.
 
 ## What this does
 
