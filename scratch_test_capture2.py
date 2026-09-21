@@ -80,6 +80,16 @@ def main():
 
     frame1 = resize(cv2.imread(f"{CAPTURE_DIR}/{calib1.camera_name}.png"))
     frame2 = resize(cv2.imread(f"{CAPTURE_DIR}/{calib2.camera_name}.png"))
+
+    # cam2's capture PNG comes out upside-down (DibrDepthTestCapture.cs debug
+    # dump, not the same path the live LiveKit-published frames or the
+    # calibration itself went through) -- correct the frame content only,
+    # leave calib2's intrinsics/extrinsics untouched.
+    if calib2.camera_name == "cam2":
+        frame2 = cv2.rotate(frame2, cv2.ROTATE_180)
+    if calib1.camera_name == "cam2":
+        frame1 = cv2.rotate(frame1, cv2.ROTATE_180)
+
     depth1, depth2 = computer.compute_pair(frame1, frame2)
     print("Result:")
     stats(calib1.camera_name, depth1)
