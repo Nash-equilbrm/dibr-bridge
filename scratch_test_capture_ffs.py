@@ -118,7 +118,22 @@ def main():
     stats(calib2.camera_name, depth2)
 
     os.makedirs(OUT_DIR, exist_ok=True)
-    vis_min, vis_max = raw.get("depthMin", 0.1), raw.get("depthMax", 10.0)
+    # Visualize against the ACTUAL computed depth range, not calibration.json's
+    # declared depthMin/depthMax -- those were recorded for a different run
+    # (different max_disp/backend) and can be stale relative to what this
+    # particular backend/settings combination actually produces, silently
+    # clipping everything to one flat color if the declared range doesn't
+    # overlap the real data (session.py's live _range_with_margin does this
+    # dynamically per-run for the same reason).
+    all_valid = np.concatenate([depth1[depth1 > 0], depth2[depth2 > 0]])
+    if all_valid.size:
+        # 1st/99th percentile, not raw min/max -- a handful of near-zero or
+        # outlier pixels would otherwise stretch the colormap so far that
+        # the real, typical depth range gets compressed into a sliver.
+        vis_min, vis_max = float(np.percentile(all_valid, 1)), float(np.percentile(all_valid, 99))
+    else:
+        vis_min, vis_max = raw.get("depthMin", 0.1), raw.get("depthMax", 10.0)
+    print(f"Visualization range (actual data): [{vis_min:.3f}, {vis_max:.3f}] m")
     save_depth_visualization(calib1.camera_name, depth1, frame1, vis_min, vis_max,
                               f"{OUT_DIR}/{calib1.camera_name}_ffs.png")
     save_depth_visualization(calib2.camera_name, depth2, frame2, vis_min, vis_max,
