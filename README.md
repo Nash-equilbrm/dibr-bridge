@@ -105,6 +105,75 @@ python -m bridge.main --server-url http://localhost:3000 --rtsp-base rtsp://loca
 (`--server-url` = the registration-service base URL; `--rtsp-base` = the
 mediamtx RTSP base URL streams get pushed to and read back from.)
 
+## Alternative stereo backend (experimental)
+
+`--stereo-backend ffs` swaps the default StereoSGBM matcher for NVIDIA's
+[Fast-FoundationStereo](https://github.com/nvlabs/fast-foundationstereo)
+(zero-shot, GPU-based, no training needed) — an **opt-in, experimental**
+alternative being evaluated because SGBM's default tuning still produces
+sparse/noisy depth on real captures (see "Known gaps" below and
+`scratch_sgbm_tune.py`). This lives entirely on the
+`feature/fast-foundationstereo-backend` branch. `main` never depends on it.
+
+**Rollback, cheapest to most complete:**
+1. Same process/branch: pass `--stereo-backend sgbm` (or unset
+   `DIBR_STEREO_BACKEND`) — restores today's exact SGBM behavior instantly.
+2. Same branch: the `ffs` code (`bridge/stereo_depth_ffs.py`) is only ever
+   imported lazily inside `BridgeSession._make_depth_computer`'s `"ffs"`
+   branch — `StereoDepthComputer`/SGBM is never modified and needs no
+   `requirements-ffs.txt` install to keep working.
+3. Full rollback: `git checkout main` — this branch and everything on it
+   disappears.
+
+**Setup:**
+1. Clone the fork **as a sibling repo**, not a submodule (same pattern as
+   `client-sdk-unity` — see top-level `CLAUDE.md`), next to this repo:
+   ```
+   git clone https://github.com/Nash-equilbrm/Fast-FoundationStereo.git ../Fast-FoundationStereo
+   ```
+   (Override the expected location with the `FFS_REPO_PATH` env var if cloned
+   elsewhere.) No commit is pinned automatically (same as `client-sdk-unity`'s
+   `file:` reference) — this integration was built and tested against commit
+   `476f4249561f7c79ca707326954f9255643412a6`.
+2. In the same `.venv` as this repo:
+   ```
+   pip uninstall opencv-python -y
+   pip install -r requirements-ffs.txt
+   ```
+   (`opencv-contrib-python` — required by the FFS repo — conflicts with plain
+   `opencv-python` in the same venv; contrib is a superset so this doesn't
+   affect the SGBM path's behavior. See comments in `requirements-ffs.txt`.)
+3. Requires an NVIDIA GPU + a driver supporting CUDA 12.4. Confirmed working
+   hardware: GTX 1650 Max-Q, 4GB VRAM, driver supports CUDA 12.7 — a much
+   weaker mobile GPU than the RTX 3090 used for upstream's benchmark numbers
+   (14–49ms/frame @ 640×480), so **real-time at this pipeline's 15fps/1280×720
+   defaults is not guaranteed and must be measured**, not assumed — see
+   `scratch_test_capture_ffs.py`.
+4. Download a research checkpoint (Google Drive, gated behind the [NVIDIA
+   Open Model Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-agreement/)
+   — no stable direct-download URL to automate) per the Fast-FoundationStereo
+   repo's own README, and place it under its `weights/<checkpoint-name>/`
+   folder.
+
+**Try it offline first** (before touching the live pipeline):
+```
+python scratch_test_capture_ffs.py <capture_dir> --checkpoint ../Fast-FoundationStereo/weights/<name>/model_best_bp2_serialize.pth
+```
+Compares against `depth_out/*.png` (SGBM, from `scratch_test_capture2.py`)
+and reports measured `compute_pair()` latency + peak VRAM against the
+~66ms/tick budget (`DEPTH_FPS=15`, both cameras, in `session.py`).
+
+**Then live** (once offline latency/quality look acceptable):
+```
+python -m bridge.main --server-url http://localhost:3000 --rtsp-base rtsp://localhost:8554 ^
+  --stereo-backend ffs --ffs-checkpoint ../Fast-FoundationStereo/weights/<name>/model_best_bp2_serialize.pth
+```
+
+PyInstaller packaging for this backend is intentionally not done — it's not
+needed just to evaluate it, and would need its own `collect_all('torch')`
+treatment plus a real size-impact assessment (torch+CUDA wheels are
+multi-GB) if the backend is ever adopted as more than an experiment.
+
 ## Known gaps / next steps for whoever picks this up
 
 - **Resolved 2026-09-20**: `bridge/livekit_source.py`'s LiveKit SDK usage —

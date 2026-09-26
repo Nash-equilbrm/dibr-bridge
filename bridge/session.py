@@ -17,7 +17,7 @@ import numpy as np
 from .livekit_source import LiveKitCameraHub
 from .registration_client import RegistrationClient
 from .rtsp_publisher import RtspPublisher, encode_depth_yuv420p
-from .stereo_depth import StereoDepthComputer
+from .stereo_depth import BaseStereoDepthComputer, StereoDepthComputer
 
 log = logging.getLogger("dibr_bridge.session")
 
@@ -49,12 +49,19 @@ class _CameraState:
 
 
 class BridgeSession:
-    def __init__(self, server_url: str, rtsp_base: str, width: int = 1280, height: int = 720, room_code: str = ""):
+    def __init__(self, server_url: str, rtsp_base: str, width: int = 1280, height: int = 720, room_code: str = "",
+                 stereo_backend: str = "sgbm", ffs_checkpoint: str | None = None, ffs_device: str = "cuda"):
         self._reg = RegistrationClient(server_url)
         self._rtsp_base = rtsp_base.rstrip("/")
         self._width = width
         self._height = height
         self._room_code = room_code
+        # "sgbm" (default) or "ffs" (Fast-FoundationStereo, opt-in/experimental
+        # -- see stereo_depth_ffs.py and README.md's "Alternative stereo
+        # backend" section). Never affects anything unless explicitly selected.
+        self._stereo_backend = stereo_backend
+        self._ffs_checkpoint = ffs_checkpoint
+        self._ffs_device = ffs_device
         self._hub: LiveKitCameraHub | None = None
         self._cameras: dict[str, _CameraState] = {}
         self._active_pair: tuple[str, str] | None = None
@@ -148,6 +155,21 @@ class BridgeSession:
             self._active_pair = None
         log.info("Removed camera '%s'", name)
 
+    def _make_depth_computer(self, calib_a, calib_b) -> BaseStereoDepthComputer:
+        if self._stereo_backend == "sgbm":
+            return StereoDepthComputer(calib_a, calib_b, out_size=(self._width, self._height))
+        elif self._stereo_backend == "ffs":
+            # Lazy import: torch/Fast-FoundationStereo are only ever required
+            # when this branch is actually selected (--stereo-backend ffs),
+            # so the default sgbm path/install never needs them.
+            from .stereo_depth_ffs import FastFoundationStereoDepthComputer
+            return FastFoundationStereoDepthComputer(
+                calib_a, calib_b, out_size=(self._width, self._height),
+                checkpoint_path=self._ffs_checkpoint, device=self._ffs_device,
+            )
+        else:
+            raise ValueError(f"Unknown stereo backend: {self._stereo_backend!r} (expected 'sgbm' or 'ffs')")
+
     async def set_active_pair(self, cam_a: str, cam_b: str) -> tuple[float, float, float, float]:
         if cam_a not in self._cameras or cam_b not in self._cameras:
             raise ValueError(f"Both cameras must be added before set_active_pair (have: {list(self._cameras)})")
@@ -160,7 +182,7 @@ class BridgeSession:
             raise ValueError(f"No calibration for pair ({cam_a}, {cam_b})")
         calib_a, calib_b = calib
 
-        computer = StereoDepthComputer(calib_a, calib_b, out_size=(self._width, self._height))
+        computer = self._make_depth_computer(calib_a, calib_b)
 
         frame_a = self._resize(self._hub.latest_frame(cam_a))
         frame_b = self._resize(self._hub.latest_frame(cam_b))
@@ -189,7 +211,7 @@ class BridgeSession:
         except asyncio.CancelledError:
             pass
 
-    async def _pump_depth(self, cam_a: str, cam_b: str, computer: StereoDepthComputer,
+    async def _pump_depth(self, cam_a: str, cam_b: str, computer: BaseStereoDepthComputer,
                            min_a: float, max_a: float, min_b: float, max_b: float) -> None:
         st_a = self._cameras[cam_a]
         st_b = self._cameras[cam_b]

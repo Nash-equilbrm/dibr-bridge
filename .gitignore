@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 *.egg-info/
 depth_out/
+depth_out_ffs/

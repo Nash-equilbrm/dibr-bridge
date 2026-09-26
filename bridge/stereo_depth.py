@@ -1,7 +1,16 @@
 """Live stereo depth for one camera pair — cv2.stereoRectify +
-initUndistortRectifyMap + remap + StereoSGBM, disparity -> metric depth via
+initUndistortRectifyMap + remap, disparity -> metric depth via
 depth = fx' * baseline / disparity (rectified focal length and baseline),
 per the plan's Phase A spec and action_log_Sep_11th_opendibr.md's stereo TODO.
+
+The actual disparity computation (StereoSGBM today; optionally
+Fast-FoundationStereo, see stereo_depth_ffs.py) is pluggable —
+BaseStereoDepthComputer owns everything backend-agnostic (rectification,
+calibration handling, the un-rectify/Z-correction step below) and subclasses
+only implement `_create_matcher`/`_compute_disparity_pair`. This exists so
+StereoDepthComputer's hard-won SGBM correctness fixes (see the three points
+below) are never at risk from backend experiments — see the "Alternative
+stereo backend" section of README.md.
 
 IMPORTANT design point (worked out while writing this, not in the original
 plan text): stereo rectification re-warps each image onto a shared epipolar
@@ -83,7 +92,13 @@ def _camera_matrix(intr) -> np.ndarray:
     ], dtype=np.float64)
 
 
-class StereoDepthComputer:
+class BaseStereoDepthComputer:
+    """Backend-agnostic rectification/calibration/depth-post-processing
+    pipeline for one camera pair. Subclasses provide the actual disparity
+    computation via `_create_matcher`/`_compute_disparity_pair` — everything
+    else here (intrinsics scaling, stereoRectify, the un-rectify/Z-correction
+    math) is shared and must not be duplicated per backend."""
+
     def __init__(self, calib_a: CameraCalibration, calib_b: CameraCalibration,
                  out_size: tuple[int, int] | None = None):
         calib_size_a = (calib_a.intrinsics.image_width, calib_a.intrinsics.image_height)
@@ -151,24 +166,29 @@ class StereoDepthComputer:
         # in the rectified geometry (the assumption compute_pair's matcher
         # order used to hardcode); < 0 means calib_b is actually LEFT and the
         # matcher input order must be swapped — see module docstring point 2.
+        # Purely a function of calibration geometry, not of any particular
+        # matcher, so every backend gets this for free.
         self._b_is_left = P2[0, 3] < 0
 
         self._fx_rect = float(P1[0, 0])
         self._baseline_m = float(np.linalg.norm(t_rel))
 
-        # numDisparities=384: covers d = fx*b/Z for the real live geometry
-        # (fx≈1200, b≈0.3 m, Z≈1 m → d≈360 px; 256 was still too small).
-        # Must be a multiple of 16.
-        self._sgbm = cv2.StereoSGBM_create(
-            minDisparity=0, numDisparities=384, blockSize=5,
-            P1=8 * 3 * 5 ** 2, P2=32 * 3 * 5 ** 2,
-            disp12MaxDiff=1, uniquenessRatio=10,
-            speckleWindowSize=100, speckleRange=32,
-        )
-        log.info("StereoDepthComputer ready: size=%s fx_rect=%.1f baseline=%.3f m "
-                  "numDisparities=%d b_is_left=%s",
-                 self._size, self._fx_rect, self._baseline_m,
-                 self._sgbm.getNumDisparities(), self._b_is_left)
+        self._create_matcher()
+
+    def _create_matcher(self) -> None:
+        """Backend hook: set up whatever the concrete disparity engine needs
+        (an SGBM matcher, a loaded model, ...). Called once, at the end of
+        `_prepare`, after all shared geometry (`_size`, `_b_is_left`,
+        `_fx_rect`, `_baseline_m`, rectify/unrectify maps) is available."""
+        raise NotImplementedError
+
+    def _compute_disparity_pair(self, rect_a_bgr: np.ndarray, rect_b_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Backend hook: given the two RECTIFIED BGR frames, return
+        (disp_a, disp_b) — plain float pixel-disparity maps (no fixed-point
+        encoding), each aligned to the rectified pixel grid. Must apply
+        `self._b_is_left` itself when the matcher needs to know which input
+        is physically left (see StereoDepthComputer's flip-trick)."""
+        raise NotImplementedError
 
     def _build_original_to_rectified_map(self, K, D, R, P) -> tuple[np.ndarray, np.ndarray]:
         w, h = self._size
@@ -193,8 +213,10 @@ class StereoDepthComputer:
         factor = rays @ R[:, 2]  # dot each ray with R's third column -> (h, w)
         return factor.astype(np.float32)
 
-    def _disparity_to_depth(self, disparity_fixedpoint: np.ndarray) -> np.ndarray:
-        disparity = disparity_fixedpoint.astype(np.float32) / 16.0  # SGBM returns Q4.4 fixed-point
+    def _disparity_to_depth(self, disparity: np.ndarray) -> np.ndarray:
+        """disparity: plain float pixel-disparity (already normalized by the
+        backend — e.g. SGBM's Q4.4 fixed-point unpack happens in the
+        backend's own `_compute_disparity_pair`, not here)."""
         with np.errstate(divide="ignore", invalid="ignore"):
             depth = np.where(disparity > 0.0, (self._fx_rect * self._baseline_m) / disparity, 0.0)
         return depth
@@ -208,8 +230,41 @@ class StereoDepthComputer:
         rect_a = cv2.remap(frame_a_bgr, map_a_x, map_a_y, cv2.INTER_LINEAR)
         rect_b = cv2.remap(frame_b_bgr, map_b_x, map_b_y, cv2.INTER_LINEAR)
 
-        gray_a = cv2.cvtColor(rect_a, cv2.COLOR_BGR2GRAY)
-        gray_b = cv2.cvtColor(rect_b, cv2.COLOR_BGR2GRAY)
+        disp_a, disp_b = self._compute_disparity_pair(rect_a, rect_b)
+
+        depth_a_rect = self._disparity_to_depth(disp_a) * self._z_correction_a
+        depth_b_rect = self._disparity_to_depth(disp_b) * self._z_correction_b
+
+        unrect_a_x, unrect_a_y = self._unrect_map_a
+        unrect_b_x, unrect_b_y = self._unrect_map_b
+        depth_a = cv2.remap(depth_a_rect, unrect_a_x, unrect_a_y, cv2.INTER_LINEAR)
+        depth_b = cv2.remap(depth_b_rect, unrect_b_x, unrect_b_y, cv2.INTER_LINEAR)
+
+        return depth_a, depth_b
+
+
+class StereoDepthComputer(BaseStereoDepthComputer):
+    """Default backend: cv2.StereoSGBM. See BaseStereoDepthComputer for the
+    shared rectification/calibration/depth pipeline this plugs into."""
+
+    def _create_matcher(self) -> None:
+        # numDisparities=384: covers d = fx*b/Z for the real live geometry
+        # (fx≈1200, b≈0.3 m, Z≈1 m → d≈360 px; 256 was still too small).
+        # Must be a multiple of 16.
+        self._sgbm = cv2.StereoSGBM_create(
+            minDisparity=0, numDisparities=384, blockSize=5,
+            P1=8 * 3 * 5 ** 2, P2=32 * 3 * 5 ** 2,
+            disp12MaxDiff=1, uniquenessRatio=10,
+            speckleWindowSize=100, speckleRange=32,
+        )
+        log.info("StereoDepthComputer ready: size=%s fx_rect=%.1f baseline=%.3f m "
+                  "numDisparities=%d b_is_left=%s",
+                 self._size, self._fx_rect, self._baseline_m,
+                 self._sgbm.getNumDisparities(), self._b_is_left)
+
+    def _compute_disparity_pair(self, rect_a_bgr: np.ndarray, rect_b_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        gray_a = cv2.cvtColor(rect_a_bgr, cv2.COLOR_BGR2GRAY)
+        gray_b = cv2.cvtColor(rect_b_bgr, cv2.COLOR_BGR2GRAY)
 
         # StereoSGBM with minDisparity=0 only yields valid positive
         # disparities when the physically-LEFT image is given first. Which
@@ -234,12 +289,8 @@ class StereoDepthComputer:
                           float(valid.min()) / 16 if valid.size else 0.0,
                           float(valid.max()) / 16 if valid.size else 0.0)
 
-        depth_a_rect = self._disparity_to_depth(disp_a_raw) * self._z_correction_a
-        depth_b_rect = self._disparity_to_depth(disp_b_raw) * self._z_correction_b
-
-        unrect_a_x, unrect_a_y = self._unrect_map_a
-        unrect_b_x, unrect_b_y = self._unrect_map_b
-        depth_a = cv2.remap(depth_a_rect, unrect_a_x, unrect_a_y, cv2.INTER_LINEAR)
-        depth_b = cv2.remap(depth_b_rect, unrect_b_x, unrect_b_y, cv2.INTER_LINEAR)
-
-        return depth_a, depth_b
+        # SGBM returns Q4.4 fixed-point; normalize to plain float disparity
+        # before handing it back to the shared compute_pair() shell.
+        disp_a = disp_a_raw.astype(np.float32) / 16.0
+        disp_b = disp_b_raw.astype(np.float32) / 16.0
+        return disp_a, disp_b

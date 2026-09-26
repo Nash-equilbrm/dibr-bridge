@@ -1,0 +1,40 @@
+# Extra dependencies for the opt-in/experimental Fast-FoundationStereo depth
+# backend (--stereo-backend ffs). NEVER merged into requirements.txt — the
+# default StereoSGBM backend must keep working with a plain
+# `pip install -r requirements.txt`, no GPU/CUDA/torch required.
+#
+# Install into the SAME venv as requirements.txt:
+#   pip install -r requirements-ffs.txt
+#
+# IMPORTANT — opencv-contrib-python vs opencv-python conflict:
+# requirements.txt installs plain `opencv-python`. Fast-FoundationStereo's own
+# requirements.txt lists `opencv-contrib-python`, which provides the same
+# `cv2` module (a strict superset of opencv-python) — the two packages must
+# NOT both be installed in the same venv (they conflict at the `cv2` import).
+# Before installing this file, run:
+#   pip uninstall opencv-python -y
+# `opencv-contrib-python` below covers everything the sgbm backend needs too,
+# so this is safe — it doesn't affect StereoDepthComputer's behavior.
+#
+# Also requires: the Fast-FoundationStereo repo (fork) cloned as a SIBLING
+# repo next to this one, i.e. ../Fast-FoundationStereo relative to this file
+# (override with the FFS_REPO_PATH env var) — see README.md's "Alternative
+# stereo backend" section.
+#   git clone https://github.com/Nash-equilbrm/Fast-FoundationStereo.git ../Fast-FoundationStereo
+#
+# And a manually-downloaded checkpoint (research checkpoints are
+# Google-Drive-gated under the NVIDIA Open Model Agreement, no stable direct
+# URL to pin here) placed under that repo's weights/<name>/ — see its README.
+
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0
+torchvision==0.21.0
+xformers
+
+opencv-contrib-python
+timm
+einops
+omegaconf
+scikit-image
+imageio
+pyyaml
