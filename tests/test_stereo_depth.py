@@ -318,8 +318,13 @@ def test_rectified_to_original_frame_depth_correction():
     tb = np.array(tvec_b).reshape(3, 1)
     R_rel = Rb @ Ra.T
     t_rel = tb - R_rel @ ta
+    # alpha must match BaseStereoDepthComputer._prepare's own stereoRectify
+    # call (alpha=-1, see stereo_depth.py) -- alpha controls the rectified
+    # camera matrix's scale/principal point, so a mismatched alpha here would
+    # compare against a different (wrong) rectification than production
+    # actually uses, not a genuine independent check.
     R1, R2, P1, P2, _, _, _ = cv2.stereoRectify(
-        K, D, K, D, (W, H), R_rel, t_rel, flags=cv2.CALIB_ZERO_DISPARITY, alpha=0)
+        K, D, K, D, (W, H), R_rel, t_rel, flags=cv2.CALIB_ZERO_DISPARITY, alpha=-1)
 
     # Sanity: this geometry actually produces non-identity rectification
     # rotation for BOTH cameras (not just B, even though calib_a's own rvec

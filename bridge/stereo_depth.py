@@ -141,9 +141,20 @@ class BaseStereoDepthComputer:
         R_rel = Rb @ Ra.T
         t_rel = tb - R_rel @ ta
 
+        # alpha=0 (zoom to only fully-overlapping pixels) crops far too
+        # aggressively for pairs with real relative rotation -- confirmed on
+        # the real rig (~26 degrees between two cameras) both by
+        # scratch_sgbm_tune.py's own earlier sweep ("established as necessary
+        # in the earlier alpha sweep") and independently here via a
+        # rect->unrect round-trip test showing the ~13%/~8% valid-depth
+        # coverage ceiling is exactly the fraction of the original frame that
+        # has ANY corresponding rectified pixel at all under alpha=0, not a
+        # disparity-matching failure. alpha=-1 lets OpenCV pick a less
+        # aggressive crop (trading some black border for retained FOV),
+        # which is what that scratch sweep actually validated.
         R1, R2, P1, P2, _Q, _roi1, _roi2 = cv2.stereoRectify(
             Ka, Da, Kb, Db, self._size, R_rel, t_rel,
-            flags=cv2.CALIB_ZERO_DISPARITY, alpha=0,
+            flags=cv2.CALIB_ZERO_DISPARITY, alpha=-1,
         )
 
         self._rect_map_a = cv2.initUndistortRectifyMap(Ka, Da, R1, P1, self._size, cv2.CV_32FC1)
