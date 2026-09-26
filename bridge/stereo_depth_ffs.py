@@ -28,6 +28,22 @@ import os
 import sys
 from pathlib import Path
 
+# Fast-FoundationStereo's core/submodule.py and core/utils/utils.py decorate a
+# few functions with @torch.compile unconditionally (not gated behind the
+# optimize_build_volume flag). torch.compile's default "inductor" backend
+# needs a matching Triton build; there is no Triton build compatible with
+# torch==2.6.0's inductor internals on Windows (confirmed: the community
+# triton-windows package installs but raises
+# "cannot import name 'AttrsDescriptor'" at model-load time — a version
+# mismatch, not something a config flag on our side fixes). Disabling dynamo
+# entirely makes @torch.compile a pass-through to eager execution instead of
+# crashing; this only costs the fusion speedup on that one cost-volume-build
+# op, not correctness. Must be set before `import torch` anywhere in this
+# process — this module is the first thing to import torch (lazily, in
+# _create_matcher below), so setting it here at module import time is early
+# enough.
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+
 import cv2
 import numpy as np
 
@@ -72,11 +88,21 @@ class FastFoundationStereoDepthComputer(BaseStereoDepthComputer):
 
     def __init__(self, calib_a, calib_b, out_size: tuple[int, int] | None = None,
                  checkpoint_path: str | None = None, device: str = "cuda",
-                 valid_iters: int = 4, max_disp: int = 192):
+                 valid_iters: int = 4, max_disp: int = 192, mixed_precision: bool = False):
         self._checkpoint_path = checkpoint_path or os.environ.get("DIBR_FFS_CHECKPOINT")
         self._device = device
         self._valid_iters = valid_iters
         self._max_disp = max_disp
+        # Default False: confirmed by direct testing (both on this rig's real
+        # captures AND the upstream repo's own bundled demo_data, ruling out a
+        # data-specific cause) that this checkpoint's internal fp16 autocast
+        # path (model.args.mixed_precision=True, gated on U.AMP_DTYPE=float16
+        # in Utils.py, independent of any outer torch.amp.autocast we apply)
+        # produces all-NaN disparity on this GPU (GTX 1650, Turing/sm_75) --
+        # forcing fp32 fixes it. Costs real throughput (this GPU's fp16 tensor
+        # cores go unused) but correctness has to come first; if tested later
+        # on a newer GPU (Ampere+) this may be safe to flip back to True.
+        self._mixed_precision = mixed_precision
         super().__init__(calib_a, calib_b, out_size=out_size)
 
     def _create_matcher(self) -> None:
@@ -114,6 +140,7 @@ class FastFoundationStereoDepthComputer(BaseStereoDepthComputer):
         model = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
         model.args.valid_iters = self._valid_iters
         model.args.max_disp = self._max_disp
+        model.args.mixed_precision = self._mixed_precision
         model.to(self._device).eval()
 
         self._torch = torch
@@ -121,9 +148,9 @@ class FastFoundationStereoDepthComputer(BaseStereoDepthComputer):
         self._model = model
         self._amp_dtype = torch.float16
         log.info("FastFoundationStereoDepthComputer ready: size=%s fx_rect=%.1f baseline=%.3f m "
-                  "valid_iters=%d max_disp=%d b_is_left=%s",
+                  "valid_iters=%d max_disp=%d mixed_precision=%s b_is_left=%s",
                   self._size, self._fx_rect, self._baseline_m,
-                  self._valid_iters, self._max_disp, self._b_is_left)
+                  self._valid_iters, self._max_disp, self._mixed_precision, self._b_is_left)
 
     def _infer_disparity(self, left_bgr: np.ndarray, right_bgr: np.ndarray) -> np.ndarray:
         """Run FFS on one (left, right) ordered pair; returns a plain float
@@ -144,8 +171,12 @@ class FastFoundationStereoDepthComputer(BaseStereoDepthComputer):
         padder = self._InputPadder(img0.shape, divis_by=32, force_square=False)
         img0, img1 = padder.pad(img0, img1)
 
+        # Note: the model gates its OWN internal autocast on
+        # model.args.mixed_precision (set in _create_matcher), independent of
+        # this outer context -- this only affects the tensor prep above, kept
+        # in sync so nothing here runs fp16 when mixed_precision is disabled.
         with torch.no_grad(), torch.amp.autocast(
-            "cuda", enabled=self._device.startswith("cuda"), dtype=self._amp_dtype
+            "cuda", enabled=self._device.startswith("cuda") and self._mixed_precision, dtype=self._amp_dtype
         ):
             disp = self._model.forward(img0, img1, iters=self._valid_iters, test_mode=True,
                                         optimize_build_volume="pytorch1")

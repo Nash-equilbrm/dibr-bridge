@@ -28,15 +28,14 @@ from bridge.stereo_depth_ffs import FastFoundationStereoDepthComputer
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
-WIDTH, HEIGHT = 1280, 720
 OUT_DIR = "depth_out_ffs"
 
 
-def resize(frame):
+def resize(frame, width, height):
     h, w = frame.shape[:2]
-    if w == WIDTH and h == HEIGHT:
+    if w == width and h == height:
         return frame
-    return cv2.resize(frame, (WIDTH, HEIGHT))
+    return cv2.resize(frame, (width, height))
 
 
 def stats(name, depth):
@@ -67,6 +66,8 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--valid-iters", type=int, default=4)
     parser.add_argument("--max-disp", type=int, default=192)
+    parser.add_argument("--width", type=int, default=1280, help="Output resolution (default matches session.py's live pipeline)")
+    parser.add_argument("--height", type=int, default=720)
     args = parser.parse_args()
 
     if not args.checkpoint:
@@ -78,13 +79,13 @@ def main():
     calib2 = CameraCalibration.from_json(raw["cam2"])
 
     computer = FastFoundationStereoDepthComputer(
-        calib1, calib2, out_size=(WIDTH, HEIGHT),
+        calib1, calib2, out_size=(args.width, args.height),
         checkpoint_path=args.checkpoint, device=args.device,
         valid_iters=args.valid_iters, max_disp=args.max_disp,
     )
 
-    frame1 = resize(cv2.imread(f"{args.capture_dir}/{calib1.camera_name}.png"))
-    frame2 = resize(cv2.imread(f"{args.capture_dir}/{calib2.camera_name}.png"))
+    frame1 = resize(cv2.imread(f"{args.capture_dir}/{calib1.camera_name}.png"), args.width, args.height)
+    frame2 = resize(cv2.imread(f"{args.capture_dir}/{calib2.camera_name}.png"), args.width, args.height)
 
     # Same debug-capture upside-down quirk scratch_test_capture2.py corrects for.
     if calib2.camera_name == "cam2":
