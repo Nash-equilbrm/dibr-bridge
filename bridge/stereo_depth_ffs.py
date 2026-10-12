@@ -111,21 +111,26 @@ class _LoadedModel:
     torch: object
     InputPadder: type
     # Serializes GPU inference: a cancelled depth pump's worker thread can
-    # still be mid-inference when the next pair's first compute starts.
+    # still be mid-inference when the next pair's first compute starts. Also
+    # guards the per-call model.args writes in _run_inference.
     infer_lock: threading.Lock
+    # The checkpoint's own max_disp, before we override it. Its disparity
+    # attention is built for that range (core/foundation_stereo.py,
+    # max_len=cfg['max_disp']//16), so asking for more isn't safe.
+    trained_max_disp: int | None
 
 
-# Process-wide model cache, keyed on everything baked into the loaded module.
-# Loading the checkpoint (torch.load + .to(cuda)) is by far the most expensive
-# step of a pair switch, and nothing about it depends on which cameras are
-# paired -- only rectification does, which stays per-computer.
+# Process-wide model cache, keyed on checkpoint + device only. Loading the
+# checkpoint (torch.load + .to(cuda)) is by far the most expensive step of a
+# pair switch. max_disp, valid_iters and mixed_precision are only read from
+# model.args inside forward(), so _run_inference sets them per call and
+# changing them (e.g. via the remote config) never needs a reload.
 _MODEL_CACHE: dict[tuple, _LoadedModel] = {}
 _MODEL_CACHE_LOCK = threading.Lock()
 
 
-def load_model(checkpoint_path: str, device: str, valid_iters: int, max_disp: int,
-               mixed_precision: bool) -> _LoadedModel:
-    key = (str(Path(checkpoint_path).resolve()), device, valid_iters, max_disp, mixed_precision)
+def load_model(checkpoint_path: str, device: str) -> _LoadedModel:
+    key = (str(Path(checkpoint_path).resolve()), device)
     with _MODEL_CACHE_LOCK:
         cached = _MODEL_CACHE.get(key)
         if cached is not None:
@@ -145,39 +150,44 @@ def load_model(checkpoint_path: str, device: str, valid_iters: int, max_disp: in
         # Note: unlike the upstream repo's scripts/run_demo.py, we don't read
         # the checkpoint folder's cfg.yaml -- that file only supplies default
         # CLI arg values for their demo script. The checkpoint itself already
-        # carries a populated `.args` (saved at training/export time); we just
-        # override the fields we actually want to control, same as
-        # run_demo.py does after its own cfg.yaml merge.
+        # carries a populated `.args` (saved at training/export time); the
+        # fields we control are overridden per call in _run_inference.
         t0 = time.perf_counter()
         log.info("Loading Fast-FoundationStereo checkpoint %s on %s ...", checkpoint_path, device)
         model = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
-        model.args.valid_iters = valid_iters
-        model.args.max_disp = max_disp
-        model.args.mixed_precision = mixed_precision
+        trained_max_disp = getattr(model.args, "max_disp", None)
         model.to(device).eval()
-        log.info("Fast-FoundationStereo checkpoint loaded in %.2fs", time.perf_counter() - t0)
+        log.info("Fast-FoundationStereo checkpoint loaded in %.2fs (trained max_disp=%s)",
+                 time.perf_counter() - t0, trained_max_disp)
 
-        loaded = _LoadedModel(model, torch, InputPadder, threading.Lock())
+        loaded = _LoadedModel(model, torch, InputPadder, threading.Lock(), trained_max_disp)
         _MODEL_CACHE[key] = loaded
         return loaded
+
+
+def check_max_disp(loaded: _LoadedModel, max_disp: int) -> None:
+    if loaded.trained_max_disp is not None and max_disp > loaded.trained_max_disp:
+        raise ValueError(f"max_disp={max_disp} exceeds this checkpoint's trained "
+                         f"max_disp={loaded.trained_max_disp}")
 
 
 def warm_up(checkpoint_path: str, device: str, size: tuple[int, int], valid_iters: int = 4,
             max_disp: int = 192, mixed_precision: bool = False) -> None:
     """Load the model into the cache and run one throwaway inference at the
-    live output size, so CUDA context creation, cuDNN algorithm selection and
-    allocator growth all happen before the first real set_active_pair.
+    live inference size, so CUDA context creation, cuDNN algorithm selection
+    and allocator growth all happen before the first real set_active_pair.
     Blocking -- session.py runs it in a worker thread at bridge startup."""
     t0 = time.perf_counter()
-    loaded = load_model(checkpoint_path, device, valid_iters, max_disp, mixed_precision)
+    loaded = load_model(checkpoint_path, device)
+    check_max_disp(loaded, max_disp)
     w, h = size
     dummy = np.zeros((h, w, 3), dtype=np.uint8)
-    _run_inference(loaded, device, valid_iters, mixed_precision, dummy, dummy)
+    _run_inference(loaded, device, valid_iters, max_disp, mixed_precision, dummy, dummy)
     log.info("Fast-FoundationStereo warm-up done in %.2fs (%dx%d)", time.perf_counter() - t0, w, h)
 
 
-def _run_inference(loaded: _LoadedModel, device: str, valid_iters: int, mixed_precision: bool,
-                   left_bgr: np.ndarray, right_bgr: np.ndarray) -> np.ndarray:
+def _run_inference(loaded: _LoadedModel, device: str, valid_iters: int, max_disp: int,
+                   mixed_precision: bool, left_bgr: np.ndarray, right_bgr: np.ndarray) -> np.ndarray:
     torch = loaded.torch
     H, W = left_bgr.shape[:2]
     # FFS expects RGB (imageio.imread order in its own demo script);
@@ -186,13 +196,18 @@ def _run_inference(loaded: _LoadedModel, device: str, valid_iters: int, mixed_pr
     right_rgb = cv2.cvtColor(right_bgr, cv2.COLOR_BGR2RGB)
 
     with loaded.infer_lock:
+        args = loaded.model.args
+        args.valid_iters = valid_iters
+        args.max_disp = max_disp
+        args.mixed_precision = mixed_precision
+
         img0 = torch.as_tensor(left_rgb).to(device).float()[None].permute(0, 3, 1, 2)
         img1 = torch.as_tensor(right_rgb).to(device).float()[None].permute(0, 3, 1, 2)
         padder = loaded.InputPadder(img0.shape, divis_by=32, force_square=False)
         img0, img1 = padder.pad(img0, img1)
 
         # Note: the model gates its OWN internal autocast on
-        # model.args.mixed_precision (set in load_model), independent of
+        # model.args.mixed_precision (set just above), independent of
         # this outer context -- this only affects the tensor prep above, kept
         # in sync so nothing here runs fp16 when mixed_precision is disabled.
         with torch.no_grad(), torch.amp.autocast(
@@ -265,8 +280,8 @@ class FastFoundationStereoDepthComputer(BaseStereoDepthComputer):
             raise RuntimeError(f"Fast-FoundationStereo checkpoint not found: {checkpoint_path}")
 
         # Cached process-wide: only the first computer pays for the load.
-        self._loaded = load_model(str(checkpoint_path), self._device, self._valid_iters,
-                                  self._max_disp, self._mixed_precision)
+        self._loaded = load_model(str(checkpoint_path), self._device)
+        check_max_disp(self._loaded, self._max_disp)
         log.info("FastFoundationStereoDepthComputer ready: size=%s fx_rect=%.1f baseline=%.3f m "
                   "valid_iters=%d max_disp=%d mixed_precision=%s b_is_left=%s",
                   self._size, self._fx_rect, self._baseline_m,
@@ -279,8 +294,8 @@ class FastFoundationStereoDepthComputer(BaseStereoDepthComputer):
         README warns "Do not swap left and right image") -- the caller applies
         the same b_is_left-aware flip-trick StereoDepthComputer's SGBM path
         uses to get the other camera's map, see _compute_disparity_pair."""
-        return _run_inference(self._loaded, self._device, self._valid_iters, self._mixed_precision,
-                              left_bgr, right_bgr)
+        return _run_inference(self._loaded, self._device, self._valid_iters, self._max_disp,
+                              self._mixed_precision, left_bgr, right_bgr)
 
     def _compute_disparity_pair(self, rect_a_bgr: np.ndarray, rect_b_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         # Same b_is_left-aware flip-trick pattern as StereoDepthComputer's
