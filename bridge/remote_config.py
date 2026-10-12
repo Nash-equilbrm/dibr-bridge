@@ -31,6 +31,19 @@ FETCH_TIMEOUT_S = 2.0
 MAX_CONFIG_BYTES = 64 * 1024
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
+# The project's tuning file (a public gist; this Raw URL always serves its
+# newest revision). Used when no --config-path/--config-url or
+# DIBR_CONFIG_PATH/DIBR_CONFIG_URL is given, so end users need no setup.
+# Opt out with --config-url off or DIBR_CONFIG_URL=off (see is_off).
+DEFAULT_CONFIG_URL = ("https://gist.githubusercontent.com/Nash-equilbrm/"
+                      "e5d57617062f0dd1222c8bea30ed7163/raw/dibr-config.json")
+_OFF_VALUES = {"", "off", "none"}
+
+
+def is_off(value: str) -> bool:
+    """True for a --config-url/DIBR_CONFIG_URL value that disables remote config."""
+    return value.strip().lower() in _OFF_VALUES
+
 
 @dataclasses.dataclass(frozen=True)
 class StereoConfig:
@@ -161,8 +174,13 @@ def default_cache_path() -> Path:
 
 class ConfigProvider:
     def __init__(self, url: str | None = None, path: str | None = None,
-                 overrides: dict | None = None, cache_path: Path | None = None):
+                 overrides: dict | None = None, cache_path: Path | None = None,
+                 origin: str | None = None):
         self._url = url
+        # Where the url/path came from, for the startup log line (e.g.
+        # "default URL", "env DIBR_CONFIG_URL", "remote config disabled by
+        # --config-url off").
+        self._origin = origin
         self._path = path
         self._overrides = overrides or {}
         self._cache_path = cache_path if cache_path is not None else default_cache_path()
@@ -187,20 +205,23 @@ class ConfigProvider:
         if self._path:
             try:
                 text = Path(self._path).read_text(encoding="utf-8")
-                return parse_config_document(json.loads(text), self._path), f"local file {self._path}"
+                return parse_config_document(json.loads(text), self._path), self._label(f"local file {self._path}")
             except (OSError, ValueError) as e:
                 log.warning("Config file unusable, falling back: %s", e)
         elif self._url:
             try:
-                return self._fetch_url(), f"URL {self._url}"
+                return self._fetch_url(), self._label(f"URL {self._url}")
             except (OSError, ValueError) as e:
                 log.warning("Config URL unusable, falling back: %s", e)
 
         if self._url or self._path:
             cached = self._read_cache()
             if cached is not None:
-                return cached, f"last-good cache {self._cache_path}"
-        return {}, "built-in defaults"
+                return cached, self._label(f"last-good cache {self._cache_path}")
+        return {}, self._label("built-in defaults")
+
+    def _label(self, source: str) -> str:
+        return f"{source} ({self._origin})" if self._origin else source
 
     def _fetch_url(self) -> dict:
         cache = self._read_cache_raw()

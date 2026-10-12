@@ -6,7 +6,8 @@ import logging
 import os
 
 from .control_server import serve
-from .remote_config import ConfigError, ConfigProvider, check_url, parse_overrides
+from .remote_config import (DEFAULT_CONFIG_URL, ConfigError, ConfigProvider, check_url, is_off,
+                            parse_overrides)
 from .session import BridgeSession
 
 log = logging.getLogger("dibr_bridge.main")
@@ -31,8 +32,9 @@ def main() -> None:
     # with fixed args; they let settings be swapped locally without touching
     # Unity C#. Precedence: CLI > env > config file/URL > built-in defaults.
     parser.add_argument("--config-url", default=None,
-                         help="https:// URL of a stereo config JSON (env DIBR_CONFIG_URL); re-fetched on "
-                              "every set_active_pair, last-good copy cached locally")
+                         help="https:// URL of a stereo config JSON (env DIBR_CONFIG_URL; default: the project's "
+                              "gist, see remote_config.DEFAULT_CONFIG_URL). 'off' disables remote config. "
+                              "Re-fetched on every set_active_pair, last-good copy cached locally")
     parser.add_argument("--config-path", default=None,
                          help="Local stereo config JSON for offline dev (env DIBR_CONFIG_PATH); beats --config-url")
     parser.add_argument("--stereo-backend", choices=["auto", "sgbm", "ffs"], default=None,
@@ -78,16 +80,27 @@ def build_config_provider(args: argparse.Namespace, environ) -> ConfigProvider:
     overrides.update(parse_overrides(",".join(cli_items), "--stereo-override/--stereo-backend"))
 
     path = args.config_path or environ.get("DIBR_CONFIG_PATH") or None
-    url = args.config_url or environ.get("DIBR_CONFIG_URL") or None
-    if url and not path:
+    if path:
+        origin = "--config-path" if args.config_path else "env DIBR_CONFIG_PATH"
+        return ConfigProvider(path=path, overrides=overrides, origin=origin)
+
+    # URL: CLI, else env, else the built-in default. "off"/"none"/"" in
+    # either place disables remote config entirely (cache ignored too).
+    if args.config_url is not None:
+        if is_off(args.config_url):
+            return ConfigProvider(overrides=overrides, origin="remote config disabled by --config-url")
+        check_url(args.config_url)  # bad CLI value: usage error
+        return ConfigProvider(url=args.config_url, overrides=overrides, origin="--config-url")
+    if "DIBR_CONFIG_URL" in environ:
+        env_url = environ["DIBR_CONFIG_URL"]
+        if is_off(env_url):
+            return ConfigProvider(overrides=overrides, origin="remote config disabled by env DIBR_CONFIG_URL")
         try:
-            check_url(url)
-        except ConfigError:
-            if args.config_url:
-                raise
-            log.warning("Ignoring env DIBR_CONFIG_URL: %s", url)
-            url = None
-    return ConfigProvider(url=url, path=path, overrides=overrides)
+            check_url(env_url)
+            return ConfigProvider(url=env_url, overrides=overrides, origin="env DIBR_CONFIG_URL")
+        except ConfigError as e:
+            log.warning("Ignoring env DIBR_CONFIG_URL, using the default URL instead: %s", e)
+    return ConfigProvider(url=DEFAULT_CONFIG_URL, overrides=overrides, origin="default URL")
 
 
 async def _run(server_url: str, rtsp_base: str, width: int, height: int, room_code: str,

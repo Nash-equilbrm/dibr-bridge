@@ -5,11 +5,34 @@ import http.server
 import json
 import threading
 
+import urllib.parse
+import urllib.request
+
 import pytest
 
+from bridge import main as bridge_main
 from bridge.main import build_config_provider
-from bridge.remote_config import (DEFAULTS, ConfigError, ConfigProvider, check_url,
+from bridge.remote_config import (DEFAULT_CONFIG_URL, DEFAULTS, ConfigError, ConfigProvider, check_url,
                                   parse_config_document, parse_overrides)
+
+_DEAD_URL = "http://127.0.0.1:1/dibr-config.json"  # closed port: fails fast, offline
+
+
+@pytest.fixture(autouse=True)
+def no_real_network(monkeypatch, tmp_path):
+    """Tests never contact GitHub: the built-in default URL points at a dead
+    local port, any non-localhost request fails loudly, and the last-good
+    cache lives in a per-test temp dir."""
+    monkeypatch.setattr(bridge_main, "DEFAULT_CONFIG_URL", _DEAD_URL)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    real_urlopen = urllib.request.urlopen
+
+    def guarded(req, *a, **kw):
+        url = req.full_url if isinstance(req, urllib.request.Request) else req
+        assert urllib.parse.urlsplit(url).hostname in ("127.0.0.1", "localhost"), f"real network: {url}"
+        return real_urlopen(req, *a, **kw)
+
+    monkeypatch.setattr(urllib.request, "urlopen", guarded)
 
 GOOD = {"version": 1, "stereo": {"backend": "ffs", "max_disp": 128, "valid_iters": 2,
                                   "infer_width": 640, "infer_height": 360, "fp16": True}}
@@ -180,8 +203,7 @@ def _args(**kw):
     return argparse.Namespace(**{**base, **kw})
 
 
-def test_cli_beats_env_beats_file(tmp_path, monkeypatch):
-    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+def test_cli_beats_env_beats_file(tmp_path):
     f = tmp_path / "local.json"
     f.write_text(json.dumps(GOOD))
     env = {"DIBR_CONFIG_PATH": str(f), "DIBR_STEREO_OVERRIDES": "max_disp=96,valid_iters=8",
@@ -192,11 +214,60 @@ def test_cli_beats_env_beats_file(tmp_path, monkeypatch):
     assert cfg.backend == "ffs"
 
 
-def test_bad_env_values_are_ignored_but_bad_cli_values_fail(tmp_path, monkeypatch):
-    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+def test_bad_env_values_are_ignored_but_bad_cli_values_fail():
     env = {"DIBR_STEREO_OVERRIDES": "max_disp=7", "DIBR_CONFIG_URL": "http://example.com/c.json"}
-    assert build_config_provider(_args(), env).load() == DEFAULTS
+    p = build_config_provider(_args(), env)
+    assert p._url == _DEAD_URL  # bad env URL -> the default URL, not example.com
+    assert p.load() == DEFAULTS
     with pytest.raises(ConfigError):
         build_config_provider(_args(stereo_override=["max_disp=7"]), {})
     with pytest.raises(ConfigError):
         build_config_provider(_args(config_url="http://example.com/c.json"), {})
+
+
+# ── Built-in default URL and opt-out ───────────────────────────────────────
+
+def test_real_default_url_is_the_project_gist_and_allowed():
+    assert DEFAULT_CONFIG_URL.startswith("https://gist.githubusercontent.com/Nash-equilbrm/")
+    check_url(DEFAULT_CONFIG_URL)
+
+
+def test_default_url_is_used_when_nothing_is_configured(server, monkeypatch):
+    monkeypatch.setattr(bridge_main, "DEFAULT_CONFIG_URL", server.url)
+    cfg = build_config_provider(_args(), {}).load()
+    assert cfg.max_disp == 128
+
+
+def test_cli_and_env_url_and_path_beat_the_default(server, tmp_path):
+    assert build_config_provider(_args(config_url=server.url), {})._url == server.url
+    assert build_config_provider(_args(), {"DIBR_CONFIG_URL": server.url})._url == server.url
+    f = tmp_path / "local.json"
+    f.write_text(json.dumps({"version": 1, "stereo": {"max_disp": 64}}))
+    p = build_config_provider(_args(), {"DIBR_CONFIG_PATH": str(f)})
+    assert p._url is None and p.load().max_disp == 64
+
+
+@pytest.mark.parametrize("cli,env", [
+    ("off", None), ("", None), ("OFF", None),
+    (None, "off"), (None, "none"), (None, ""),
+])
+def test_opt_out_disables_remote_and_ignores_cache(server, monkeypatch, cli, env, caplog):
+    monkeypatch.setattr(bridge_main, "DEFAULT_CONFIG_URL", server.url)
+    build_config_provider(_args(), {}).load()  # populate the last-good cache
+    environ = {} if env is None else {"DIBR_CONFIG_URL": env}
+    p = build_config_provider(_args(config_url=cli), environ)
+    assert p._url is None
+    caplog.set_level("INFO")
+    assert p.load() == DEFAULTS  # built-in defaults only, cache ignored
+    assert "remote config disabled" in caplog.text
+
+
+def test_default_url_offline_falls_back_to_cache_then_defaults(server, monkeypatch, caplog):
+    caplog.set_level("INFO")
+    assert build_config_provider(_args(), {}).load() == DEFAULTS  # dead URL, no cache yet
+    assert "built-in defaults (default URL)" in caplog.text
+    monkeypatch.setattr(bridge_main, "DEFAULT_CONFIG_URL", server.url)
+    build_config_provider(_args(), {}).load()  # online once -> cache
+    monkeypatch.setattr(bridge_main, "DEFAULT_CONFIG_URL", _DEAD_URL)
+    assert build_config_provider(_args(), {}).load().max_disp == 128
+    assert "last-good cache" in caplog.text

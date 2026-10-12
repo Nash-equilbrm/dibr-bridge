@@ -237,12 +237,17 @@ end-user machines.
 1. CLI: `--stereo-backend`, `--stereo-override KEY=VALUE` (repeatable).
 2. Env: `DIBR_STEREO_BACKEND`, `DIBR_STEREO_OVERRIDES="max_disp=128,fp16=true"`.
 3. The config file: `--config-path` / `DIBR_CONFIG_PATH` (local, for offline
-   dev; beats the URL), else `--config-url` / `DIBR_CONFIG_URL`. If the file
-   or URL is unusable, the last-good copy cached at
+   dev; beats any URL), else `--config-url`, else `DIBR_CONFIG_URL`, else the
+   built-in default URL (the project gist below). If the file or URL is
+   unusable, the last-good copy cached at
    `%LOCALAPPDATA%\dibr-bridge\config_cache.json` is used instead.
 4. Built-in defaults.
 
-A bad CLI value is a usage error. A bad env value is logged and ignored.
+A bad CLI value is a usage error. A bad env value is logged and ignored (a
+bad `DIBR_CONFIG_URL` falls back to the default URL). The startup log line
+names the source, e.g. `Stereo config from URL https://… (default URL): …`,
+`… (env DIBR_CONFIG_URL)`, `last-good cache … (default URL)` or
+`built-in defaults (remote config disabled by --config-url)`.
 
 **When it's read:** at startup (which picks the backend and warm-up
 settings) and again on every `set_active_pair`. Each read runs in a worker
@@ -258,14 +263,37 @@ size differs from the output size, frames are resized down for matching and
 depth is upsampled back with nearest-neighbour. The 1280×720 contract with
 OpenDIBR doesn't change.
 
-**The project's current config** is a public gist; this always-latest Raw
-URL serves its newest revision (GitHub's raw CDN can lag a few minutes after
-an edit):
+**The project's current config is the built-in default.** With no
+`--config-path`/`--config-url`/`DIBR_CONFIG_PATH`/`DIBR_CONFIG_URL`, the
+bridge reads `DEFAULT_CONFIG_URL` in `bridge/remote_config.py`, a public
+gist whose always-latest Raw URL serves its newest revision (GitHub's raw
+CDN can lag a few minutes after an edit):
+
+```
+https://gist.githubusercontent.com/Nash-equilbrm/e5d57617062f0dd1222c8bea30ed7163/raw/dibr-config.json
+```
+
+Editing that gist retunes every installed bridge on its next pair switch, so
+the Unity launcher doesn't need to pass anything.
+
+**Privacy:** unless disabled, every bridge start and every pair switch sends
+one HTTPS request to `gist.githubusercontent.com` (GitHub sees the machine's
+IP and a `dibr-bridge` User-Agent; nothing else is sent). **To disable:**
+`--config-url off` (or an empty value) or env `DIBR_CONFIG_URL=off` (`none`
+also works). Remote config is then skipped entirely, the cache is ignored
+too, and only the built-in defaults plus CLI/env overrides apply.
+
+**Reproducible experiments:** pin a specific gist revision instead of the
+always-latest URL. On the gist page, open "Revisions", click "Raw" on the
+revision you want, and pass that URL. It contains the revision hash
+(`…/raw/<revision-sha>/dibr-config.json`) and never changes:
 
 ```
 python -m bridge.main --server-url http://localhost:3000 --room-code <CODE> ^
-  --config-url https://gist.githubusercontent.com/Nash-equilbrm/e5d57617062f0dd1222c8bea30ed7163/raw/dibr-config.json
+  --config-url https://gist.githubusercontent.com/Nash-equilbrm/e5d57617062f0dd1222c8bea30ed7163/raw/<revision-sha>/dibr-config.json
 ```
+
+Or use `--config-path` with a local copy, which needs no network at all.
 
 **URLs and hosting:** only `https://` (plain `http://` only for
 `localhost`/`127.0.0.1`, for dev); redirects must stay on an allowed scheme;
