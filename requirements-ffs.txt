@@ -26,10 +26,13 @@
 # Google-Drive-gated under the NVIDIA Open Model Agreement, no stable direct
 # URL to pin here) placed under that repo's weights/<name>/ — see its README.
 
---extra-index-url https://download.pytorch.org/whl/cu124
-torch==2.6.0
-torchvision==0.21.0
-xformers
+# cu128 build: the first CUDA build with sm_120 (RTX 50xx / Blackwell) kernels;
+# cu124 builds fail on those GPUs. Has cp313 Windows wheels. xformers is
+# deliberately not installed -- Fast-FoundationStereo's model code never
+# imports it.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.7.1
+torchvision==0.22.1
 
 opencv-contrib-python
 timm
@@ -38,3 +41,4 @@ omegaconf
 scikit-image
 imageio
 pyyaml
+scipy

@@ -105,19 +105,34 @@ python -m bridge.main --server-url http://localhost:3000 --rtsp-base rtsp://loca
 (`--server-url` = the registration-service base URL; `--rtsp-base` = the
 mediamtx RTSP base URL streams get pushed to and read back from.)
 
-## Alternative stereo backend (experimental)
+## Stereo backends (FFS default when available)
 
-`--stereo-backend ffs` swaps the default StereoSGBM matcher for NVIDIA's
-[Fast-FoundationStereo](https://github.com/nvlabs/fast-foundationstereo)
-(zero-shot, GPU-based, no training needed) — an **opt-in, experimental**
-alternative being evaluated because SGBM's default tuning still produces
-sparse/noisy depth on real captures (see "Known gaps" below and
-`scratch_sgbm_tune.py`). This lives entirely on the
-`feature/fast-foundationstereo-backend` branch. `main` never depends on it.
+NVIDIA's [Fast-FoundationStereo](https://github.com/nvlabs/fast-foundationstereo)
+(zero-shot, GPU-based, no training needed) is the intended depth backend;
+StereoSGBM stays in the code as the fallback. `--stereo-backend` (env
+`DIBR_STEREO_BACKEND`) defaults to `auto`: ffs if a checkpoint is found and
+torch + CUDA work, otherwise sgbm with a loud `FALLBACK to sgbm` warning
+explaining why. Explicit `ffs` that can't run, or a failed model warm-up,
+falls back the same way rather than crashing the bridge. Checkpoint lookup
+when `--ffs-checkpoint`/`DIBR_FFS_CHECKPOINT` is unset: first
+`<exe or repo dir>/weights/<name>/model_best_bp2_serialize.pth`, then the
+sibling `Fast-FoundationStereo/weights/<name>/`. The model is loaded and
+warmed up once at bridge startup in a worker thread, then reused for every
+`set_active_pair`. This lives on the `feature/fast-foundationstereo-backend`
+branch; `main` never depends on it.
+
+Measured on an RTX 5070 (driver 591.86, torch 2.7.1+cu128, checkpoint
+`23-36-37`, `valid_iters=4`, `max_disp=192`, 1280×720): torch import ~1.2s;
+startup warm-up (load + first inference) ~2.9s; one inference ~280ms fp32 /
+~240ms fp16; `compute_pair` (two inferences, one per camera) ~590ms fp32 /
+~490ms fp16; building the per-pair computer with the cached model ~0.2s;
+peak VRAM ~7.6GB. fp16 vs fp32 disparity on the upstream demo pair: MAE
+0.008px, max 1.9px. fp32 stays the default (see stereo_depth_ffs.py: fp16
+gave all-NaN output on a Turing GTX 1650).
 
 **Rollback, cheapest to most complete:**
-1. Same process/branch: pass `--stereo-backend sgbm` (or unset
-   `DIBR_STEREO_BACKEND`) — restores today's exact SGBM behavior instantly.
+1. Same process/branch: pass `--stereo-backend sgbm` (or set
+   `DIBR_STEREO_BACKEND=sgbm`) — restores the exact SGBM behavior instantly.
 2. Same branch: the `ffs` code (`bridge/stereo_depth_ffs.py`) is only ever
    imported lazily inside `BridgeSession._make_depth_computer`'s `"ffs"`
    branch — `StereoDepthComputer`/SGBM is never modified and needs no
@@ -143,8 +158,10 @@ sparse/noisy depth on real captures (see "Known gaps" below and
    (`opencv-contrib-python` — required by the FFS repo — conflicts with plain
    `opencv-python` in the same venv; contrib is a superset so this doesn't
    affect the SGBM path's behavior. See comments in `requirements-ffs.txt`.)
-3. Requires an NVIDIA GPU + a driver supporting CUDA 12.4. Confirmed working
-   hardware: GTX 1650 Max-Q, 4GB VRAM, driver supports CUDA 12.7 — a much
+3. Requires an NVIDIA GPU + a driver supporting CUDA 12.8 (the cu128 torch
+   build is the first with RTX 50xx / sm_120 kernels). Confirmed working:
+   RTX 5070 (numbers above) and, on the earlier cu124 build, a
+   GTX 1650 Max-Q, 4GB VRAM, driver supports CUDA 12.7 — a much
    weaker mobile GPU than the RTX 3090 used for upstream's benchmark numbers
    (14–49ms/frame @ 640×480), so **real-time at this pipeline's 15fps/1280×720
    defaults is not guaranteed and must be measured**, not assumed — see
@@ -153,7 +170,8 @@ sparse/noisy depth on real captures (see "Known gaps" below and
    Open Model Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-agreement/)
    — no stable direct-download URL to automate) per the Fast-FoundationStereo
    repo's own README, and place it under its `weights/<checkpoint-name>/`
-   folder.
+   folder (e.g. `weights/23-36-37/model_best_bp2_serialize.pth`, plus its
+   `cfg.yaml`).
 
 **Try it offline first** (before touching the live pipeline):
 ```
