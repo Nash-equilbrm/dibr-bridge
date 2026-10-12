@@ -199,7 +199,7 @@ and reports measured `compute_pair()` latency + peak VRAM against the
 
 **Then live** (once offline latency/quality look acceptable):
 ```
-python -m bridge.main --server-url http://localhost:3000 --rtsp-base rtsp://localhost:8554 ^
+python -m bridge.main --server-url http://localhost:3000 --rtsp-base rtsp://localhost:8554 --room-code <CODE> ^
   --stereo-backend ffs --ffs-checkpoint ../Fast-FoundationStereo/weights/<name>/model_best_bp2_serialize.pth
 ```
 
@@ -207,6 +207,66 @@ PyInstaller packaging for this backend is intentionally not done — it's not
 needed just to evaluate it, and would need its own `collect_all('torch')`
 treatment plus a real size-impact assessment (torch+CUDA wheels are
 multi-GB) if the backend is ever adopted as more than an experiment.
+
+## Remote stereo config
+
+Stereo tuning can be changed without rebuilding or restarting, through a
+small versioned JSON file (`bridge/remote_config.py`; the defaults are in
+`config.example.json`):
+
+```json
+{"version": 1, "stereo": {"backend": "auto", "max_disp": 192, "valid_iters": 4,
+                          "infer_width": 1280, "infer_height": 720, "fp16": false}}
+```
+
+| Key | Allowed values | Notes |
+|---|---|---|
+| `backend` | `auto`, `sgbm`, `ffs` | `auto`/`ffs` still fall back to sgbm if ffs can't run |
+| `max_disp` | 32–512, multiple of 32 | ffs only; must also be ≤ the checkpoint's trained value (416 for `23-36-37`) |
+| `valid_iters` | 1–32 | ffs only |
+| `infer_width`, `infer_height` | 320–1920 / 180–1080, multiples of 8, set together | omit both to infer at `--width`/`--height` |
+| `fp16` | `true`, `false` | ffs only |
+
+All keys are optional; missing ones keep the built-in defaults. A known key
+with a bad value rejects the whole file. Unknown keys are ignored with a
+warning. **The file can only set these numbers/enums.** Checkpoint paths,
+devices, URLs and commands stay CLI/env-only, because the bridge runs on
+end-user machines.
+
+**Sources and precedence** (highest first):
+1. CLI: `--stereo-backend`, `--stereo-override KEY=VALUE` (repeatable).
+2. Env: `DIBR_STEREO_BACKEND`, `DIBR_STEREO_OVERRIDES="max_disp=128,fp16=true"`.
+3. The config file: `--config-path` / `DIBR_CONFIG_PATH` (local, for offline
+   dev; beats the URL), else `--config-url` / `DIBR_CONFIG_URL`. If the file
+   or URL is unusable, the last-good copy cached at
+   `%LOCALAPPDATA%\dibr-bridge\config_cache.json` is used instead.
+4. Built-in defaults.
+
+A bad CLI value is a usage error. A bad env value is logged and ignored.
+
+**When it's read:** at startup (which picks the backend and warm-up
+settings) and again on every `set_active_pair`. Each read runs in a worker
+thread with a 2 s timeout and `If-None-Match`/ETag, and never raises. One log
+line shows the source and resolved values whenever they change. Every
+setting applies on the next pair switch. None of them needs a model reload,
+because the FFS model is cached per checkpoint and the tuning values are set
+per inference. The new pair's depth computer is built and run once *before*
+anything is swapped in. If that fails (e.g. GPU out of memory, `max_disp`
+above the checkpoint's range), the switch uses the previous working settings
+instead, or the built-in defaults on the first switch. When the inference
+size differs from the output size, frames are resized down for matching and
+depth is upsampled back with nearest-neighbour. The 1280×720 contract with
+OpenDIBR doesn't change.
+
+**URLs and hosting:** only `https://` (plain `http://` only for
+`localhost`/`127.0.0.1`, for dev); redirects must stay on an allowed scheme;
+max 64 KB. Host the file somewhere that serves the raw bytes, e.g. a public
+GitHub repo's `raw.githubusercontent.com/...` URL or a gist's "Raw" URL.
+Google Drive share links don't work: they return an HTML page (preview or
+virus-scan confirmation), which is rejected as invalid JSON, and they hit
+download quotas. A Drive file only works as a direct-download link
+(`https://drive.google.com/uc?export=download&id=<FILE_ID>`), and even that
+is less reliable than GitHub raw.
 
 ## Known gaps / next steps for whoever picks this up
 

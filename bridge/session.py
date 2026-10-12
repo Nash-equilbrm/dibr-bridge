@@ -17,6 +17,7 @@ import numpy as np
 from .livekit_source import LiveKitCameraHub
 from .registration_client import RegistrationClient
 from .rtsp_publisher import RtspPublisher, encode_depth_yuv420p
+from .remote_config import DEFAULTS, ConfigProvider, StereoConfig
 from .stereo_depth import BaseStereoDepthComputer, StereoDepthComputer
 
 log = logging.getLogger("dibr_bridge.session")
@@ -50,18 +51,21 @@ class _CameraState:
 
 class BridgeSession:
     def __init__(self, server_url: str, rtsp_base: str, width: int = 1280, height: int = 720, room_code: str = "",
-                 stereo_backend: str = "auto", ffs_checkpoint: str | None = None, ffs_device: str = "cuda"):
+                 config_provider: ConfigProvider | None = None, ffs_checkpoint: str | None = None,
+                 ffs_device: str = "cuda"):
         self._reg = RegistrationClient(server_url)
         self._rtsp_base = rtsp_base.rstrip("/")
         self._width = width
         self._height = height
         self._room_code = room_code
-        # Requested backend: "auto" (ffs if it can run here, else sgbm),
-        # "sgbm", or "ffs" (Fast-FoundationStereo, see stereo_depth_ffs.py).
-        # Resolved to a concrete "sgbm"/"ffs" in _resolve_stereo_backend().
-        self._stereo_backend = stereo_backend
+        # Stereo tuning (backend, max_disp, valid_iters, inference size, fp16)
+        # comes from the config provider -- re-read at startup and on every
+        # set_active_pair, see remote_config.py. Paths/devices never do.
+        self._config = config_provider or ConfigProvider()
+        self._stereo: StereoConfig | None = None  # last successfully applied
         self._ffs_checkpoint = ffs_checkpoint
         self._ffs_device = ffs_device
+        self._ffs_broken = False  # set if warm-up failed: sgbm for the rest of the session
         self._ffs_warmup: asyncio.Future | None = None
         self._hub: LiveKitCameraHub | None = None
         self._cameras: dict[str, _CameraState] = {}
@@ -70,13 +74,14 @@ class BridgeSession:
         self._placeholder_task: asyncio.Task | None = None
 
     async def start(self) -> None:
-        self._resolve_stereo_backend()
-        if self._stereo_backend == "ffs":
+        cfg = await asyncio.to_thread(self._config.load)
+        if self._resolve_stereo_backend(cfg.backend) == "ffs":
             # Off the event loop: model load + first CUDA inference takes
             # seconds, and must not stall LiveKit/placeholder pumping.
             from . import stereo_depth_ffs
             self._ffs_warmup = asyncio.ensure_future(asyncio.to_thread(
-                stereo_depth_ffs.warm_up, self._ffs_checkpoint, self._ffs_device, (self._width, self._height)))
+                stereo_depth_ffs.warm_up, self._ffs_checkpoint, self._ffs_device, self._infer_size(cfg),
+                cfg.valid_iters, cfg.max_disp, cfg.fp16))
 
         token = self._reg.fetch_viewer_token(room_code=self._room_code or None)
         self._hub = LiveKitCameraHub(token.livekit_url, token.token)
@@ -85,11 +90,17 @@ class BridgeSession:
 
         self._start_placeholder_stream()
 
-    def _resolve_stereo_backend(self) -> None:
-        requested = self._stereo_backend
+    def _infer_size(self, cfg: StereoConfig) -> tuple[int, int]:
+        if cfg.infer_width and cfg.infer_height:
+            return cfg.infer_width, cfg.infer_height
+        return self._width, self._height
+
+    def _resolve_stereo_backend(self, requested: str) -> str:
+        """Concrete backend ("sgbm"/"ffs") for a requested one ("auto"/"sgbm"/
+        "ffs"): ffs only if it can actually run here, else a loud sgbm
+        fallback. Logs only when the outcome changes."""
         if requested == "sgbm":
-            log.info("Stereo backend: sgbm (requested)")
-            return
+            return self._log_backend("sgbm", "Stereo backend: sgbm (requested)")
         if requested not in ("auto", "ffs"):
             raise ValueError(f"Unknown stereo backend: {requested!r} (expected 'auto', 'sgbm' or 'ffs')")
 
@@ -97,15 +108,22 @@ class BridgeSession:
         if not self._ffs_checkpoint:
             found = stereo_depth_ffs.find_default_checkpoint()
             self._ffs_checkpoint = str(found) if found else None
-        reason = stereo_depth_ffs.unavailable_reason(self._ffs_checkpoint, self._ffs_device)
-        if reason is None:
-            self._stereo_backend = "ffs"
-            log.info("Stereo backend: ffs (%s), checkpoint %s on %s", requested, self._ffs_checkpoint, self._ffs_device)
+        if self._ffs_broken:
+            reason = "Fast-FoundationStereo warm-up failed earlier this session"
         else:
-            self._stereo_backend = "sgbm"
-            log.warning("=" * 72)
-            log.warning("Stereo backend FALLBACK to sgbm (requested %s): %s", requested, reason)
-            log.warning("=" * 72)
+            reason = stereo_depth_ffs.unavailable_reason(self._ffs_checkpoint, self._ffs_device)
+        if reason is None:
+            return self._log_backend("ffs", f"Stereo backend: ffs ({requested}), checkpoint "
+                                            f"{self._ffs_checkpoint} on {self._ffs_device}")
+        bar = "=" * 72
+        return self._log_backend("sgbm", f"{bar}\nStereo backend FALLBACK to sgbm (requested {requested}): "
+                                         f"{reason}\n{bar}", level=logging.WARNING)
+
+    def _log_backend(self, backend: str, message: str, level: int = logging.INFO) -> str:
+        if message != getattr(self, "_last_backend_message", None):
+            log.log(level, "%s", message)
+            self._last_backend_message = message
+        return backend
 
     async def _ensure_ffs_ready(self) -> None:
         """Wait for the startup warm-up; if it failed, fall back to sgbm for
@@ -116,7 +134,7 @@ class BridgeSession:
             await self._ffs_warmup
         except Exception:
             log.exception("=" * 72 + "\nFast-FoundationStereo warm-up failed -- FALLBACK to sgbm")
-            self._stereo_backend = "sgbm"
+            self._ffs_broken = True
         self._ffs_warmup = None
 
     @property
@@ -198,20 +216,29 @@ class BridgeSession:
             self._active_pair = None
         log.info("Removed camera '%s'", name)
 
-    def _make_depth_computer(self, calib_a, calib_b) -> BaseStereoDepthComputer:
-        if self._stereo_backend == "sgbm":
-            return StereoDepthComputer(calib_a, calib_b, out_size=(self._width, self._height))
-        elif self._stereo_backend == "ffs":
+    def _build_depth(self, cfg: StereoConfig, calib_a, calib_b,
+                     frame_a: np.ndarray, frame_b: np.ndarray) -> tuple["_DepthPipeline", np.ndarray, np.ndarray]:
+        """Blocking (runs in a worker thread): build the computer for `cfg`
+        and run its first compute_pair, so a bad setting (e.g. max_disp above
+        the checkpoint's range, or GPU OOM at a bigger inference size) fails
+        here, before anything is swapped in."""
+        backend = self._resolve_stereo_backend(cfg.backend)
+        infer_size = self._infer_size(cfg)
+        if backend == "sgbm":
+            computer = StereoDepthComputer(calib_a, calib_b, out_size=infer_size)
+        else:
             # Lazy import: torch/Fast-FoundationStereo are only ever required
             # when ffs is actually in use, so an sgbm-only install never needs
             # them. The model itself is cached process-wide after warm-up.
             from .stereo_depth_ffs import FastFoundationStereoDepthComputer
-            return FastFoundationStereoDepthComputer(
-                calib_a, calib_b, out_size=(self._width, self._height),
+            computer = FastFoundationStereoDepthComputer(
+                calib_a, calib_b, out_size=infer_size,
                 checkpoint_path=self._ffs_checkpoint, device=self._ffs_device,
+                valid_iters=cfg.valid_iters, max_disp=cfg.max_disp, mixed_precision=cfg.fp16,
             )
-        else:
-            raise ValueError(f"Unknown stereo backend: {self._stereo_backend!r} (expected 'sgbm' or 'ffs')")
+        pipeline = _DepthPipeline(computer, infer_size, (self._width, self._height))
+        depth_a, depth_b = pipeline.compute(frame_a, frame_b)
+        return pipeline, depth_a, depth_b
 
     async def set_active_pair(self, cam_a: str, cam_b: str) -> tuple[float, float, float, float]:
         if cam_a not in self._cameras or cam_b not in self._cameras:
@@ -225,21 +252,37 @@ class BridgeSession:
             raise ValueError(f"No calibration for pair ({cam_a}, {cam_b})")
         calib_a, calib_b = calib
 
+        # Re-read the stereo config on every switch (bounded by the fetch
+        # timeout, never raises) so tuning changes apply without a restart.
+        cfg = await asyncio.to_thread(self._config.load)
         await self._ensure_ffs_ready()
+
+        frame_a = self._hub.latest_frame(cam_a)
+        frame_b = self._hub.latest_frame(cam_b)
         # Worker thread: rectification-map setup and the first compute_pair
         # are slow enough (FFS especially) to stall color pumping otherwise.
-        computer = await asyncio.to_thread(self._make_depth_computer, calib_a, calib_b)
-
-        frame_a = self._resize(self._hub.latest_frame(cam_a))
-        frame_b = self._resize(self._hub.latest_frame(cam_b))
-        depth_a, depth_b = await asyncio.to_thread(computer.compute_pair, frame_a, frame_b)
+        try:
+            pipeline, depth_a, depth_b = await asyncio.to_thread(
+                self._build_depth, cfg, calib_a, calib_b, frame_a, frame_b)
+        except Exception:
+            # Keep the last settings that worked (built-in defaults before
+            # the first successful switch) rather than failing the switch.
+            fallback = self._stereo or DEFAULTS
+            if fallback == cfg:
+                raise
+            log.exception("Stereo config (%s) failed for pair (%s, %s) -- using previous settings (%s)",
+                          cfg.describe(), cam_a, cam_b, fallback.describe())
+            cfg = fallback
+            pipeline, depth_a, depth_b = await asyncio.to_thread(
+                self._build_depth, cfg, calib_a, calib_b, frame_a, frame_b)
+        self._stereo = cfg
 
         min_a, max_a = self._range_with_margin(depth_a)
         min_b, max_b = self._range_with_margin(depth_b)
 
         self._active_pair = (cam_a, cam_b)
         self._depth_task = asyncio.ensure_future(
-            self._pump_depth(cam_a, cam_b, computer, min_a, max_a, min_b, max_b)
+            self._pump_depth(cam_a, cam_b, pipeline, min_a, max_a, min_b, max_b)
         )
         log.info("Active pair set to (%s, %s); depth range A=[%.2f,%.2f] B=[%.2f,%.2f]",
                   cam_a, cam_b, min_a, max_a, min_b, max_b)
@@ -257,7 +300,7 @@ class BridgeSession:
         except asyncio.CancelledError:
             pass
 
-    async def _pump_depth(self, cam_a: str, cam_b: str, computer: BaseStereoDepthComputer,
+    async def _pump_depth(self, cam_a: str, cam_b: str, pipeline: "_DepthPipeline",
                            min_a: float, max_a: float, min_b: float, max_b: float) -> None:
         st_a = self._cameras[cam_a]
         st_b = self._cameras[cam_b]
@@ -266,8 +309,7 @@ class BridgeSession:
                 frame_a = self._hub.latest_frame(cam_a)
                 frame_b = self._hub.latest_frame(cam_b)
                 if frame_a is not None and frame_b is not None:
-                    depth_a, depth_b = await asyncio.to_thread(
-                        computer.compute_pair, self._resize(frame_a), self._resize(frame_b))
+                    depth_a, depth_b = await asyncio.to_thread(pipeline.compute, frame_a, frame_b)
                     st_a.depth_publisher.push(encode_depth_yuv420p(depth_a, min_a, max_a))
                     st_b.depth_publisher.push(encode_depth_yuv420p(depth_b, min_b, max_b))
                 await asyncio.sleep(1.0 / DEPTH_FPS)
@@ -283,3 +325,33 @@ class BridgeSession:
         span = max(d_max - d_min, 0.01)
         margin = span * DEPTH_RANGE_MARGIN
         return max(d_min - margin, 0.01), d_max + margin
+
+
+class _DepthPipeline:
+    """A depth computer running at `infer_size`, wrapped so its output always
+    comes back at the bridge's output size -- the resolution contract with
+    OpenDIBR doesn't change when the config lowers the inference size."""
+
+    def __init__(self, computer: BaseStereoDepthComputer, infer_size: tuple[int, int], out_size: tuple[int, int]):
+        self._computer = computer
+        self._infer_size = infer_size
+        self._out_size = out_size
+
+    def compute(self, frame_a: np.ndarray, frame_b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        depth_a, depth_b = self._computer.compute_pair(self._fit(frame_a), self._fit(frame_b))
+        return self._upsample(depth_a), self._upsample(depth_b)
+
+    def _fit(self, frame: np.ndarray) -> np.ndarray:
+        h, w = frame.shape[:2]
+        if (w, h) == self._infer_size:
+            return frame
+        shrinking = w > self._infer_size[0]
+        return cv2.resize(frame, self._infer_size, interpolation=cv2.INTER_AREA if shrinking else cv2.INTER_LINEAR)
+
+    def _upsample(self, depth: np.ndarray) -> np.ndarray:
+        if self._infer_size == self._out_size:
+            return depth
+        # Nearest, not bilinear: depth is metric Z (not disparity, so no value
+        # rescaling) and 0 marks invalid pixels; interpolating would invent
+        # depths across object edges and smear holes into valid neighbours.
+        return cv2.resize(depth, self._out_size, interpolation=cv2.INTER_NEAREST)

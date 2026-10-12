@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "stereo": {
+    "backend": "auto",
+    "max_disp": 192,
+    "valid_iters": 4,
+    "infer_width": 1280,
+    "infer_height": 720,
+    "fp16": false
+  }
+}
