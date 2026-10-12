@@ -44,6 +44,10 @@ from pathlib import Path
 # enough.
 os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 
+import dataclasses
+import threading
+import time
+
 import cv2
 import numpy as np
 
@@ -53,11 +57,151 @@ log = logging.getLogger("dibr_bridge.stereo_depth_ffs")
 
 _DIBR_BRIDGE_REPO_ROOT = Path(__file__).resolve().parent.parent
 _DEFAULT_FFS_REPO_PATH = _DIBR_BRIDGE_REPO_ROOT.parent / "Fast-FoundationStereo"
+# Upstream's checkpoint filename inside every weights/<name>/ folder.
+_CHECKPOINT_FILENAME = "model_best_bp2_serialize.pth"
 
 
 def _ffs_repo_path() -> Path:
     override = os.environ.get("FFS_REPO_PATH")
     return Path(override) if override else _DEFAULT_FFS_REPO_PATH
+
+
+def _app_dir() -> Path:
+    """Directory of the frozen exe, or this repo's root when run from source."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return _DIBR_BRIDGE_REPO_ROOT
+
+
+def find_default_checkpoint() -> Path | None:
+    """Look for a checkpoint without any CLI/env config: first
+    <app dir>/weights/<name>/<file> (the shipped layout), then the sibling
+    Fast-FoundationStereo repo's own weights/ (the dev layout). Sorted so the
+    pick is deterministic if more than one checkpoint is present."""
+    for root in (_app_dir() / "weights", _ffs_repo_path() / "weights"):
+        if root.is_dir():
+            hits = sorted(root.glob(f"*/{_CHECKPOINT_FILENAME}")) or sorted(root.glob("*/*.pth"))
+            if hits:
+                return hits[0]
+    return None
+
+
+def unavailable_reason(checkpoint_path: str | None, device: str) -> str | None:
+    """None if the ffs backend can run with these settings, else a short
+    human-readable reason -- used by session.py to fall back to sgbm loudly
+    instead of crashing the bridge."""
+    if not checkpoint_path:
+        return "no checkpoint found (pass --ffs-checkpoint, set DIBR_FFS_CHECKPOINT, or place one under weights/<name>/)"
+    if not Path(checkpoint_path).is_file():
+        return f"checkpoint not found: {checkpoint_path}"
+    if not _ffs_repo_path().is_dir():
+        return f"Fast-FoundationStereo repo not found at {_ffs_repo_path()} (set FFS_REPO_PATH)"
+    try:
+        import torch
+    except ImportError:
+        return "torch is not installed (see requirements-ffs.txt)"
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        return "CUDA is not available (no NVIDIA GPU/driver, or torch build lacks this GPU's arch)"
+    return None
+
+
+@dataclasses.dataclass
+class _LoadedModel:
+    model: object
+    torch: object
+    InputPadder: type
+    # Serializes GPU inference: a cancelled depth pump's worker thread can
+    # still be mid-inference when the next pair's first compute starts.
+    infer_lock: threading.Lock
+
+
+# Process-wide model cache, keyed on everything baked into the loaded module.
+# Loading the checkpoint (torch.load + .to(cuda)) is by far the most expensive
+# step of a pair switch, and nothing about it depends on which cameras are
+# paired -- only rectification does, which stays per-computer.
+_MODEL_CACHE: dict[tuple, _LoadedModel] = {}
+_MODEL_CACHE_LOCK = threading.Lock()
+
+
+def load_model(checkpoint_path: str, device: str, valid_iters: int, max_disp: int,
+               mixed_precision: bool) -> _LoadedModel:
+    key = (str(Path(checkpoint_path).resolve()), device, valid_iters, max_disp, mixed_precision)
+    with _MODEL_CACHE_LOCK:
+        cached = _MODEL_CACHE.get(key)
+        if cached is not None:
+            return cached
+
+        _ensure_ffs_importable()
+        try:
+            import torch
+        except ImportError as e:
+            raise RuntimeError(
+                "Fast-FoundationStereo backend selected but its dependencies "
+                "aren't installed -- see requirements-ffs.txt / README.md's "
+                "'Alternative stereo backend' section."
+            ) from e
+        from core.utils.utils import InputPadder  # Fast-FoundationStereo sibling repo
+
+        # Note: unlike the upstream repo's scripts/run_demo.py, we don't read
+        # the checkpoint folder's cfg.yaml -- that file only supplies default
+        # CLI arg values for their demo script. The checkpoint itself already
+        # carries a populated `.args` (saved at training/export time); we just
+        # override the fields we actually want to control, same as
+        # run_demo.py does after its own cfg.yaml merge.
+        t0 = time.perf_counter()
+        log.info("Loading Fast-FoundationStereo checkpoint %s on %s ...", checkpoint_path, device)
+        model = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
+        model.args.valid_iters = valid_iters
+        model.args.max_disp = max_disp
+        model.args.mixed_precision = mixed_precision
+        model.to(device).eval()
+        log.info("Fast-FoundationStereo checkpoint loaded in %.2fs", time.perf_counter() - t0)
+
+        loaded = _LoadedModel(model, torch, InputPadder, threading.Lock())
+        _MODEL_CACHE[key] = loaded
+        return loaded
+
+
+def warm_up(checkpoint_path: str, device: str, size: tuple[int, int], valid_iters: int = 4,
+            max_disp: int = 192, mixed_precision: bool = False) -> None:
+    """Load the model into the cache and run one throwaway inference at the
+    live output size, so CUDA context creation, cuDNN algorithm selection and
+    allocator growth all happen before the first real set_active_pair.
+    Blocking -- session.py runs it in a worker thread at bridge startup."""
+    t0 = time.perf_counter()
+    loaded = load_model(checkpoint_path, device, valid_iters, max_disp, mixed_precision)
+    w, h = size
+    dummy = np.zeros((h, w, 3), dtype=np.uint8)
+    _run_inference(loaded, device, valid_iters, mixed_precision, dummy, dummy)
+    log.info("Fast-FoundationStereo warm-up done in %.2fs (%dx%d)", time.perf_counter() - t0, w, h)
+
+
+def _run_inference(loaded: _LoadedModel, device: str, valid_iters: int, mixed_precision: bool,
+                   left_bgr: np.ndarray, right_bgr: np.ndarray) -> np.ndarray:
+    torch = loaded.torch
+    H, W = left_bgr.shape[:2]
+    # FFS expects RGB (imageio.imread order in its own demo script);
+    # frames here are BGR (OpenCV convention throughout this codebase).
+    left_rgb = cv2.cvtColor(left_bgr, cv2.COLOR_BGR2RGB)
+    right_rgb = cv2.cvtColor(right_bgr, cv2.COLOR_BGR2RGB)
+
+    with loaded.infer_lock:
+        img0 = torch.as_tensor(left_rgb).to(device).float()[None].permute(0, 3, 1, 2)
+        img1 = torch.as_tensor(right_rgb).to(device).float()[None].permute(0, 3, 1, 2)
+        padder = loaded.InputPadder(img0.shape, divis_by=32, force_square=False)
+        img0, img1 = padder.pad(img0, img1)
+
+        # Note: the model gates its OWN internal autocast on
+        # model.args.mixed_precision (set in load_model), independent of
+        # this outer context -- this only affects the tensor prep above, kept
+        # in sync so nothing here runs fp16 when mixed_precision is disabled.
+        with torch.no_grad(), torch.amp.autocast(
+            "cuda", enabled=device.startswith("cuda") and mixed_precision, dtype=torch.float16
+        ):
+            disp = loaded.model.forward(img0, img1, iters=valid_iters, test_mode=True,
+                                        optimize_build_volume="pytorch1")
+        disp = padder.unpad(disp.float())
+        return disp.data.cpu().numpy().reshape(H, W).clip(0, None)
 
 
 def _ensure_ffs_importable() -> None:
@@ -107,16 +251,6 @@ class FastFoundationStereoDepthComputer(BaseStereoDepthComputer):
 
     def _create_matcher(self) -> None:
         _ensure_ffs_importable()
-        try:
-            import torch
-        except ImportError as e:
-            raise RuntimeError(
-                "Fast-FoundationStereo backend selected but its dependencies "
-                "aren't installed -- see requirements-ffs.txt / README.md's "
-                "'Alternative stereo backend' section."
-            ) from e
-        from core.utils.utils import InputPadder  # Fast-FoundationStereo sibling repo
-
         if not self._checkpoint_path:
             raise RuntimeError(
                 "Fast-FoundationStereo backend selected but no checkpoint given "
@@ -130,23 +264,9 @@ class FastFoundationStereoDepthComputer(BaseStereoDepthComputer):
         if not checkpoint_path.is_file():
             raise RuntimeError(f"Fast-FoundationStereo checkpoint not found: {checkpoint_path}")
 
-        # Note: unlike the upstream repo's scripts/run_demo.py, we don't read
-        # the checkpoint folder's cfg.yaml -- that file only supplies default
-        # CLI arg values for their demo script. The checkpoint itself already
-        # carries a populated `.args` (saved at training/export time); we just
-        # override the two fields we actually want to control, same as
-        # run_demo.py does after its own cfg.yaml merge.
-        log.info("Loading Fast-FoundationStereo checkpoint %s on %s ...", checkpoint_path, self._device)
-        model = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
-        model.args.valid_iters = self._valid_iters
-        model.args.max_disp = self._max_disp
-        model.args.mixed_precision = self._mixed_precision
-        model.to(self._device).eval()
-
-        self._torch = torch
-        self._InputPadder = InputPadder
-        self._model = model
-        self._amp_dtype = torch.float16
+        # Cached process-wide: only the first computer pays for the load.
+        self._loaded = load_model(str(checkpoint_path), self._device, self._valid_iters,
+                                  self._max_disp, self._mixed_precision)
         log.info("FastFoundationStereoDepthComputer ready: size=%s fx_rect=%.1f baseline=%.3f m "
                   "valid_iters=%d max_disp=%d mixed_precision=%s b_is_left=%s",
                   self._size, self._fx_rect, self._baseline_m,
@@ -159,29 +279,8 @@ class FastFoundationStereoDepthComputer(BaseStereoDepthComputer):
         README warns "Do not swap left and right image") -- the caller applies
         the same b_is_left-aware flip-trick StereoDepthComputer's SGBM path
         uses to get the other camera's map, see _compute_disparity_pair."""
-        torch = self._torch
-        H, W = left_bgr.shape[:2]
-        # FFS expects RGB (imageio.imread order in its own demo script);
-        # frames here are BGR (OpenCV convention throughout this codebase).
-        left_rgb = cv2.cvtColor(left_bgr, cv2.COLOR_BGR2RGB)
-        right_rgb = cv2.cvtColor(right_bgr, cv2.COLOR_BGR2RGB)
-
-        img0 = torch.as_tensor(left_rgb).to(self._device).float()[None].permute(0, 3, 1, 2)
-        img1 = torch.as_tensor(right_rgb).to(self._device).float()[None].permute(0, 3, 1, 2)
-        padder = self._InputPadder(img0.shape, divis_by=32, force_square=False)
-        img0, img1 = padder.pad(img0, img1)
-
-        # Note: the model gates its OWN internal autocast on
-        # model.args.mixed_precision (set in _create_matcher), independent of
-        # this outer context -- this only affects the tensor prep above, kept
-        # in sync so nothing here runs fp16 when mixed_precision is disabled.
-        with torch.no_grad(), torch.amp.autocast(
-            "cuda", enabled=self._device.startswith("cuda") and self._mixed_precision, dtype=self._amp_dtype
-        ):
-            disp = self._model.forward(img0, img1, iters=self._valid_iters, test_mode=True,
-                                        optimize_build_volume="pytorch1")
-        disp = padder.unpad(disp.float())
-        return disp.data.cpu().numpy().reshape(H, W).clip(0, None)
+        return _run_inference(self._loaded, self._device, self._valid_iters, self._mixed_precision,
+                              left_bgr, right_bgr)
 
     def _compute_disparity_pair(self, rect_a_bgr: np.ndarray, rect_b_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         # Same b_is_left-aware flip-trick pattern as StereoDepthComputer's

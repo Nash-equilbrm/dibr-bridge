@@ -23,16 +23,19 @@ def main() -> None:
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--room-code", required=True, help="LiveKit room code to join, e.g. FADW88")
     parser.add_argument("--log-level", default="INFO")
-    # Opt-in/experimental alternative depth backend — see stereo_depth_ffs.py
-    # and README.md's "Alternative stereo backend" section. Env var fallback
-    # matters because Unity launches the frozen exe with fixed args; this lets
-    # the backend be swapped locally without touching Unity C#.
-    parser.add_argument("--stereo-backend", choices=["sgbm", "ffs"],
-                         default=os.environ.get("DIBR_STEREO_BACKEND", "sgbm"),
-                         help="Depth backend: 'sgbm' (default, StereoSGBM) or "
-                              "'ffs' (Fast-FoundationStereo, requires requirements-ffs.txt + a GPU)")
+    # Depth backend — see stereo_depth_ffs.py and README.md's "Stereo
+    # backends" section. Env var fallback matters because Unity launches the
+    # bridge with fixed args; this lets the backend be swapped locally
+    # without touching Unity C#.
+    parser.add_argument("--stereo-backend", choices=["auto", "sgbm", "ffs"],
+                         default=os.environ.get("DIBR_STEREO_BACKEND", "auto"),
+                         help="Depth backend: 'auto' (default: ffs if a checkpoint, torch and CUDA are "
+                              "available, else sgbm with a warning), 'sgbm' (StereoSGBM) or "
+                              "'ffs' (Fast-FoundationStereo; still falls back to sgbm if it can't run)")
     parser.add_argument("--ffs-checkpoint", default=os.environ.get("DIBR_FFS_CHECKPOINT"),
-                         help="Path to a Fast-FoundationStereo .pth checkpoint (only used with --stereo-backend ffs)")
+                         help="Path to a Fast-FoundationStereo .pth checkpoint (default: first "
+                              "weights/<name>/model_best_bp2_serialize.pth next to the exe/repo, "
+                              "then under the Fast-FoundationStereo repo)")
     parser.add_argument("--ffs-device", default=os.environ.get("DIBR_FFS_DEVICE", "cuda"),
                          help="torch device for the ffs backend (only used with --stereo-backend ffs)")
     args = parser.parse_args()

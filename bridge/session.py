@@ -50,18 +50,19 @@ class _CameraState:
 
 class BridgeSession:
     def __init__(self, server_url: str, rtsp_base: str, width: int = 1280, height: int = 720, room_code: str = "",
-                 stereo_backend: str = "sgbm", ffs_checkpoint: str | None = None, ffs_device: str = "cuda"):
+                 stereo_backend: str = "auto", ffs_checkpoint: str | None = None, ffs_device: str = "cuda"):
         self._reg = RegistrationClient(server_url)
         self._rtsp_base = rtsp_base.rstrip("/")
         self._width = width
         self._height = height
         self._room_code = room_code
-        # "sgbm" (default) or "ffs" (Fast-FoundationStereo, opt-in/experimental
-        # -- see stereo_depth_ffs.py and README.md's "Alternative stereo
-        # backend" section). Never affects anything unless explicitly selected.
+        # Requested backend: "auto" (ffs if it can run here, else sgbm),
+        # "sgbm", or "ffs" (Fast-FoundationStereo, see stereo_depth_ffs.py).
+        # Resolved to a concrete "sgbm"/"ffs" in _resolve_stereo_backend().
         self._stereo_backend = stereo_backend
         self._ffs_checkpoint = ffs_checkpoint
         self._ffs_device = ffs_device
+        self._ffs_warmup: asyncio.Future | None = None
         self._hub: LiveKitCameraHub | None = None
         self._cameras: dict[str, _CameraState] = {}
         self._active_pair: tuple[str, str] | None = None
@@ -69,12 +70,54 @@ class BridgeSession:
         self._placeholder_task: asyncio.Task | None = None
 
     async def start(self) -> None:
+        self._resolve_stereo_backend()
+        if self._stereo_backend == "ffs":
+            # Off the event loop: model load + first CUDA inference takes
+            # seconds, and must not stall LiveKit/placeholder pumping.
+            from . import stereo_depth_ffs
+            self._ffs_warmup = asyncio.ensure_future(asyncio.to_thread(
+                stereo_depth_ffs.warm_up, self._ffs_checkpoint, self._ffs_device, (self._width, self._height)))
+
         token = self._reg.fetch_viewer_token(room_code=self._room_code or None)
         self._hub = LiveKitCameraHub(token.livekit_url, token.token)
         await self._hub.connect()
         log.info("Connected to LiveKit at %s", token.livekit_url)
 
         self._start_placeholder_stream()
+
+    def _resolve_stereo_backend(self) -> None:
+        requested = self._stereo_backend
+        if requested == "sgbm":
+            log.info("Stereo backend: sgbm (requested)")
+            return
+        if requested not in ("auto", "ffs"):
+            raise ValueError(f"Unknown stereo backend: {requested!r} (expected 'auto', 'sgbm' or 'ffs')")
+
+        from . import stereo_depth_ffs
+        if not self._ffs_checkpoint:
+            found = stereo_depth_ffs.find_default_checkpoint()
+            self._ffs_checkpoint = str(found) if found else None
+        reason = stereo_depth_ffs.unavailable_reason(self._ffs_checkpoint, self._ffs_device)
+        if reason is None:
+            self._stereo_backend = "ffs"
+            log.info("Stereo backend: ffs (%s), checkpoint %s on %s", requested, self._ffs_checkpoint, self._ffs_device)
+        else:
+            self._stereo_backend = "sgbm"
+            log.warning("=" * 72)
+            log.warning("Stereo backend FALLBACK to sgbm (requested %s): %s", requested, reason)
+            log.warning("=" * 72)
+
+    async def _ensure_ffs_ready(self) -> None:
+        """Wait for the startup warm-up; if it failed, fall back to sgbm for
+        the rest of the session instead of failing every set_active_pair."""
+        if self._ffs_warmup is None:
+            return
+        try:
+            await self._ffs_warmup
+        except Exception:
+            log.exception("=" * 72 + "\nFast-FoundationStereo warm-up failed -- FALLBACK to sgbm")
+            self._stereo_backend = "sgbm"
+        self._ffs_warmup = None
 
     @property
     def placeholder_urls(self) -> tuple[str, str]:
@@ -160,8 +203,8 @@ class BridgeSession:
             return StereoDepthComputer(calib_a, calib_b, out_size=(self._width, self._height))
         elif self._stereo_backend == "ffs":
             # Lazy import: torch/Fast-FoundationStereo are only ever required
-            # when this branch is actually selected (--stereo-backend ffs),
-            # so the default sgbm path/install never needs them.
+            # when ffs is actually in use, so an sgbm-only install never needs
+            # them. The model itself is cached process-wide after warm-up.
             from .stereo_depth_ffs import FastFoundationStereoDepthComputer
             return FastFoundationStereoDepthComputer(
                 calib_a, calib_b, out_size=(self._width, self._height),
@@ -182,11 +225,14 @@ class BridgeSession:
             raise ValueError(f"No calibration for pair ({cam_a}, {cam_b})")
         calib_a, calib_b = calib
 
-        computer = self._make_depth_computer(calib_a, calib_b)
+        await self._ensure_ffs_ready()
+        # Worker thread: rectification-map setup and the first compute_pair
+        # are slow enough (FFS especially) to stall color pumping otherwise.
+        computer = await asyncio.to_thread(self._make_depth_computer, calib_a, calib_b)
 
         frame_a = self._resize(self._hub.latest_frame(cam_a))
         frame_b = self._resize(self._hub.latest_frame(cam_b))
-        depth_a, depth_b = computer.compute_pair(frame_a, frame_b)
+        depth_a, depth_b = await asyncio.to_thread(computer.compute_pair, frame_a, frame_b)
 
         min_a, max_a = self._range_with_margin(depth_a)
         min_b, max_b = self._range_with_margin(depth_b)
@@ -220,7 +266,8 @@ class BridgeSession:
                 frame_a = self._hub.latest_frame(cam_a)
                 frame_b = self._hub.latest_frame(cam_b)
                 if frame_a is not None and frame_b is not None:
-                    depth_a, depth_b = computer.compute_pair(self._resize(frame_a), self._resize(frame_b))
+                    depth_a, depth_b = await asyncio.to_thread(
+                        computer.compute_pair, self._resize(frame_a), self._resize(frame_b))
                     st_a.depth_publisher.push(encode_depth_yuv420p(depth_a, min_a, max_a))
                     st_b.depth_publisher.push(encode_depth_yuv420p(depth_b, min_b, max_b))
                 await asyncio.sleep(1.0 / DEPTH_FPS)
