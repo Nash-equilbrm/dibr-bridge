@@ -258,6 +258,15 @@ size differs from the output size, frames are resized down for matching and
 depth is upsampled back with nearest-neighbour. The 1280×720 contract with
 OpenDIBR doesn't change.
 
+**The project's current config** is a public gist; this always-latest Raw
+URL serves its newest revision (GitHub's raw CDN can lag a few minutes after
+an edit):
+
+```
+python -m bridge.main --server-url http://localhost:3000 --room-code <CODE> ^
+  --config-url https://gist.githubusercontent.com/Nash-equilbrm/e5d57617062f0dd1222c8bea30ed7163/raw/dibr-config.json
+```
+
 **URLs and hosting:** only `https://` (plain `http://` only for
 `localhost`/`127.0.0.1`, for dev); redirects must stay on an allowed scheme;
 max 64 KB. Host the file somewhere that serves the raw bytes, e.g. a public
