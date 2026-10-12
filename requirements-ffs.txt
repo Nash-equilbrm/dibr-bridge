@@ -22,8 +22,8 @@
 # stereo backend" section.
 #   git clone https://github.com/Nash-equilbrm/Fast-FoundationStereo.git ../Fast-FoundationStereo
 #
-# And a manually-downloaded checkpoint (research checkpoints are
-# Google-Drive-gated under the NVIDIA Open Model Agreement, no stable direct
+# And a manually-downloaded checkpoint (research checkpoints are on Google
+# Drive under the NVIDIA Source Code License, non-commercial; no stable direct
 # URL to pin here) placed under that repo's weights/<name>/ — see its README.
 
 # cu128 build: the first CUDA build with sm_120 (RTX 50xx / Blackwell) kernels;

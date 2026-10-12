@@ -226,8 +226,9 @@ class FastFoundationStereoDepthComputer(BaseStereoDepthComputer):
     """Opt-in alternative to StereoDepthComputer. Requires requirements-ffs.txt
     installed (torch + CUDA) and the Fast-FoundationStereo sibling repo
     cloned next to this one, plus a manually-downloaded checkpoint (research
-    checkpoints are Google-Drive-gated under the NVIDIA Open Model Agreement,
-    no stable direct-download URL to automate) -- see README.md.
+    checkpoints are on Google Drive under the NVIDIA Source Code License,
+    non-commercial; no stable direct-download URL to automate) -- see
+    README.md's "Licensing / redistribution".
     """
 
     def __init__(self, calib_a, calib_b, out_size: tuple[int, int] | None = None,
@@ -256,9 +257,8 @@ class FastFoundationStereoDepthComputer(BaseStereoDepthComputer):
                 "Fast-FoundationStereo backend selected but no checkpoint given "
                 "-- pass --ffs-checkpoint <path to a .pth under weights/<name>/> "
                 "or set DIBR_FFS_CHECKPOINT. Research checkpoints are on Google "
-                "Drive (gated behind the NVIDIA Open Model Agreement, no direct "
-                "download URL to automate) -- see the Fast-FoundationStereo "
-                "repo's README for the link."
+                "Drive (no direct download URL to automate) -- see the "
+                "Fast-FoundationStereo repo's README for the link."
             )
         checkpoint_path = Path(self._checkpoint_path)
         if not checkpoint_path.is_file():

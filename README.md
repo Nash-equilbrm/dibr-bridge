@@ -166,12 +166,28 @@ gave all-NaN output on a Turing GTX 1650).
    (14–49ms/frame @ 640×480), so **real-time at this pipeline's 15fps/1280×720
    defaults is not guaranteed and must be measured**, not assumed — see
    `scratch_test_capture_ffs.py`.
-4. Download a research checkpoint (Google Drive, gated behind the [NVIDIA
-   Open Model Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-agreement/)
-   — no stable direct-download URL to automate) per the Fast-FoundationStereo
+4. Download a research checkpoint (Google Drive, no stable direct-download
+   URL to automate; licensed under the NVIDIA Source Code License — see
+   "Licensing / redistribution" below) per the Fast-FoundationStereo
    repo's own README, and place it under its `weights/<checkpoint-name>/`
    folder (e.g. `weights/23-36-37/model_best_bp2_serialize.pth`, plus its
    `cfg.yaml`).
+
+**Licensing / redistribution** (our reading of the Fast-FoundationStereo
+repo's `LICENSE.txt`, `model_card.md` and `readme.md` — not legal advice):
+- The research checkpoints on Google Drive (e.g. `23-36-37`) fall under the
+  same NVIDIA Source Code License as the code (`LICENSE.txt`; the model
+  card applies it to the model). It allows reproduction and redistribution
+  (§2.1), but only non-commercially, "for research purposes only" (§3.3).
+- Any redistribution, e.g. bundling the checkpoint into the app's
+  `StreamingAssets/DibrBridge/weights/`, must ship a complete copy of the
+  FFS `LICENSE.txt` alongside it and keep its notices intact (§3.1).
+- Only the separate C-Fast-FoundationStereo model on HuggingFace is under
+  the [NVIDIA Open Model Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-agreement/)
+  (the commercial-use path). A commercial release would need that model
+  and its terms, not the research checkpoints.
+- The licence text names the "Software"/"Work" and does not mention weights
+  explicitly; ask NVIDIA (contact in the FFS readme) if certainty matters.
 
 **Try it offline first** (before touching the live pipeline):
 ```
