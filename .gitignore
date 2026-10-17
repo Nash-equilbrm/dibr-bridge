@@ -10,3 +10,5 @@ depth_out_uncalibrated/
 depth_out_selfcalib/
 depth_out_benchmark/
 test_in/
+build-ffs/
+dist-ffs/
