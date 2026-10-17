@@ -246,10 +246,13 @@ class BaseStereoDepthComputer:
         depth_a_rect = self._disparity_to_depth(disp_a) * self._z_correction_a
         depth_b_rect = self._disparity_to_depth(disp_b) * self._z_correction_b
 
+        # INTER_NEAREST, not INTER_LINEAR: invalid depth is 0, and bilinear
+        # blends it with valid neighbours, inventing depths at hole edges
+        # (0 m / 4 m -> 2 m) that also drag down the per-pair depth range.
         unrect_a_x, unrect_a_y = self._unrect_map_a
         unrect_b_x, unrect_b_y = self._unrect_map_b
-        depth_a = cv2.remap(depth_a_rect, unrect_a_x, unrect_a_y, cv2.INTER_LINEAR)
-        depth_b = cv2.remap(depth_b_rect, unrect_b_x, unrect_b_y, cv2.INTER_LINEAR)
+        depth_a = cv2.remap(depth_a_rect, unrect_a_x, unrect_a_y, cv2.INTER_NEAREST)
+        depth_b = cv2.remap(depth_b_rect, unrect_b_x, unrect_b_y, cv2.INTER_NEAREST)
 
         return depth_a, depth_b
 

@@ -348,3 +348,40 @@ def test_rectified_to_original_frame_depth_correction():
             assert abs(got_factor - expected_factor) < 1e-3, (
                 f"cam {name} z-correction at ({u},{v}): got {got_factor:.4f}, "
                 f"expected {expected_factor:.4f}")
+
+
+# ── Unrectify must not invent depth at hole edges ───────────────────────────
+
+def test_unrectify_does_not_blend_valid_depth_with_holes():
+    """Invalid depth is 0. Mapping rectified depth back to the original grid
+    with bilinear interpolation blends 0 with valid neighbours, producing
+    fake depths (0 m / 4 m -> 2 m) along every hole edge, which also drags
+    the per-pair depth range down. Disparity is injected directly (half the
+    rectified frame valid, half invalid) so this checks only the unrectify
+    remap, not SGBM. A ~10 degree rotation makes the unrectify maps
+    fractional, which is what exposes the blending."""
+    W, H = 640, 360
+    fx = 500.0
+    calib_a = _make_calib(fx, fx, W / 2, H / 2, W, H, [0.0, 0.0, 0.0])
+    calib_b = _make_calib(fx, fx, W / 2, H / 2, W, H, [0.1, 0.0, 0.0])
+    calib_b.extrinsics.rvec = [0.0, np.radians(10.0), 0.0]
+    computer = StereoDepthComputer(calib_a, calib_b, out_size=(W, H))
+
+    def fake_disparity(rect_a, rect_b):
+        disp = np.zeros(rect_a.shape[:2], dtype=np.float32)
+        disp[:, : disp.shape[1] // 2] = 20.0   # valid left half
+        return disp, disp.copy()               # right half invalid (0)
+
+    computer._compute_disparity_pair = fake_disparity
+    frame = np.zeros((H, W, 3), dtype=np.uint8)
+    depth_a, depth_b = computer.compute_pair(frame, frame)
+
+    for depth, z_corr in ((depth_a, computer._z_correction_a), (depth_b, computer._z_correction_b)):
+        valid = depth[depth > 0]
+        assert valid.size > 0, "no valid depth at all"
+        z_true = computer._fx_rect * computer._baseline_m / 20.0
+        lo = z_true * float(np.min(z_corr))
+        # Every non-zero output must be a real (corrected) depth, never a
+        # blend toward 0. Bilinear blending yields values down to ~lo/2.
+        assert valid.min() >= lo * 0.99, (
+            f"blended hole-edge depth {valid.min():.3f} m < real minimum {lo:.3f} m")

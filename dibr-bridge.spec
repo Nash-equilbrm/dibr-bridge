@@ -13,7 +13,12 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # The ffs backend is never frozen (README "Alternative stereo backend").
+    # Without these, a build venv that has requirements-ffs.txt installed
+    # makes PyInstaller follow stereo_depth_ffs's lazy `import torch` and
+    # bundle several GB of torch+CUDA. Missing torch at runtime already
+    # falls back to sgbm (stereo_depth_ffs.unavailable_reason).
+    excludes=['torch', 'torchvision', 'timm'],
     noarchive=False,
     optimize=0,
 )

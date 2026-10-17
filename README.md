@@ -134,7 +134,7 @@ gave all-NaN output on a Turing GTX 1650).
 1. Same process/branch: pass `--stereo-backend sgbm` (or set
    `DIBR_STEREO_BACKEND=sgbm`) — restores the exact SGBM behavior instantly.
 2. Same branch: the `ffs` code (`bridge/stereo_depth_ffs.py`) is only ever
-   imported lazily inside `BridgeSession._make_depth_computer`'s `"ffs"`
+   imported lazily inside `BridgeSession._build_depth`'s `"ffs"`
    branch — `StereoDepthComputer`/SGBM is never modified and needs no
    `requirements-ffs.txt` install to keep working.
 3. Full rollback: `git checkout main` — this branch and everything on it
@@ -207,6 +207,10 @@ PyInstaller packaging for this backend is intentionally not done — it's not
 needed just to evaluate it, and would need its own `collect_all('torch')`
 treatment plus a real size-impact assessment (torch+CUDA wheels are
 multi-GB) if the backend is ever adopted as more than an experiment.
+`dibr-bridge.spec` explicitly excludes `torch`/`torchvision`/`timm`, so
+freezing from a venv that also has `requirements-ffs.txt` installed still
+produces the ~180 MB SGBM-only exe (the ffs backend falls back to sgbm when
+torch is missing).
 
 ## Remote stereo config
 
