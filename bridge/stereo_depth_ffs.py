@@ -61,9 +61,31 @@ _DEFAULT_FFS_REPO_PATH = _DIBR_BRIDGE_REPO_ROOT.parent / "Fast-FoundationStereo"
 _CHECKPOINT_FILENAME = "model_best_bp2_serialize.pth"
 
 
+def _bundled_ffs_src() -> Path | None:
+    """The ffs_src/ folder (Fast-FoundationStereo's core/ + Utils.py) that
+    dibr-bridge-ffs.spec ships as data, or None when not frozen / not bundled.
+    PyInstaller 6 onedir puts datas under <exe dir>/_internal (sys._MEIPASS);
+    older layouts put them beside the exe."""
+    if not getattr(sys, "frozen", False):
+        return None
+    bases = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        bases.append(Path(meipass))
+    exe_dir = Path(sys.executable).resolve().parent
+    bases += [exe_dir / "_internal", exe_dir]
+    for base in bases:
+        candidate = base / "ffs_src"
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
 def _ffs_repo_path() -> Path:
     override = os.environ.get("FFS_REPO_PATH")
-    return Path(override) if override else _DEFAULT_FFS_REPO_PATH
+    if override:
+        return Path(override)
+    return _bundled_ffs_src() or _DEFAULT_FFS_REPO_PATH
 
 
 def _app_dir() -> Path:
